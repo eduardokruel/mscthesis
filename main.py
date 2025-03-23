@@ -10,10 +10,10 @@ from difflib import SequenceMatcher
 def main():
     parser = argparse.ArgumentParser(description='Extract entities from MuSiQue dataset and visualize relationships')
     parser.add_argument('--test-api', action='store_true', help='Test the DeepSeek API connection')
-    parser.add_argument('--example-id', type=str, help='ID of the example to process', default='7')
+    parser.add_argument('--example-id', type=str, help='ID of the example to process', default='6')
     parser.add_argument('--dataset-path', type=str, help='Path to the MuSiQue dataset')
     parser.add_argument('--list-examples', action='store_true', help='List available example IDs')
-    parser.add_argument('--max-hops', type=int, default=8, help='Maximum number of hops for document retrieval')
+    parser.add_argument('--max-hops', type=int, default=10, help='Maximum number of hops for document retrieval')
     parser.add_argument('--max-workers', type=int, default=20, help='Maximum number of parallel workers for API calls')
     parser.add_argument('--skip-bipartite', action='store_true', help='Skip bipartite graph visualization')
     
