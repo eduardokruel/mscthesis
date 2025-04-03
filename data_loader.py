@@ -47,7 +47,7 @@ def load_musique_dataset(file_path=None):
     """Load and process the MuSiQue dataset"""
     # Default path if none provided
     if file_path is None:
-        file_path = 'datasets/musique/musique_full_v1.0_dev.jsonl'
+        file_path = 'datasets/musique/musique_ans_v1.0_dev.jsonl'
     
     # Try to get absolute path
     abs_path = get_absolute_path(file_path)
@@ -55,8 +55,8 @@ def load_musique_dataset(file_path=None):
     if abs_path is None:
         # If we couldn't find the file, try some alternative paths
         alternative_paths = [
-            'mscthesis/datasets/musique/musique_full_v1.0_dev.jsonl',
-            '../datasets/musique/musique_full_v1.0_dev.jsonl'
+            'mscthesis/datasets/musique/musique_ans_v1.0_dev.jsonl',
+            '../datasets/musique/musique_ans_v1.0_dev.jsonl'
         ]
         
         for alt_path in alternative_paths:

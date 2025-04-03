@@ -5,13 +5,29 @@ import pandas as pd
 import networkx as nx
 import concurrent.futures
 from tqdm import tqdm
+import time
+from difflib import SequenceMatcher
 
 class EntityExtractor:
-    def __init__(self):
-        self.deepseek = DeepSeekAPI()
+    def __init__(self, verbose=False, model_name="deepseek-chat", use_cache=True):
+        self.deepseek = DeepSeekAPI(model_name=model_name)
+        self.verbose = verbose
+        self.model_name = model_name
+        self.use_cache = use_cache
+        # Add caches for API responses
+        self.entity_cache = {}  # Cache for entity extraction
+        self.relationship_cache = {}  # Cache for relationship extraction
     
     def extract_entities_from_question(self, question):
-        """Extract entities from a question using DeepSeek API"""
+        """Extract entities from a question using DeepSeek API with caching"""
+        # Check cache first if caching is enabled
+        cache_key = f"question_{hash(question)}"
+        if self.use_cache and cache_key in self.entity_cache:
+            if self.verbose:
+                print("Using cached question entities")
+            return self.entity_cache[cache_key]
+        
+        # Original implementation
         prompt = f"""
         Extract all entities from the following question:
         
@@ -43,6 +59,11 @@ class EntityExtractor:
             
             # Parse the JSON
             entities = json.loads(json_str)
+            
+            # Cache the result if caching is enabled
+            if self.use_cache:
+                self.entity_cache[cache_key] = entities
+            
             return entities
         except Exception as e:
             print(f"Error parsing response: {e}")
@@ -50,7 +71,15 @@ class EntityExtractor:
             return []
     
     def extract_entities_from_paragraph(self, paragraph_text):
-        """Extract entities from a paragraph using DeepSeek API"""
+        """Extract entities from a paragraph using DeepSeek API with caching"""
+        # Check cache first if caching is enabled
+        cache_key = f"paragraph_{hash(paragraph_text)}"
+        if self.use_cache and cache_key in self.entity_cache:
+            if self.verbose:
+                print("Using cached paragraph entities")
+            return self.entity_cache[cache_key]
+        
+        # Original implementation
         prompt = f"""
         Extract all entities from the following paragraph:
         
@@ -70,18 +99,23 @@ class EntityExtractor:
         
         # Extract JSON from response
         try:
-            # Find JSON in the response using regex
+            # Find JSON in the response
             json_match = re.search(r'\[.*\]', response, re.DOTALL)
             if json_match:
                 json_str = json_match.group(0)
             else:
                 json_str = response
                 
-            # Clean up the string to ensure it's valid JSON
+            # Clean up the string
             json_str = re.sub(r'```.*?```', '', json_str, flags=re.DOTALL)
             
             # Parse the JSON
             entities = json.loads(json_str)
+            
+            # Cache the result if caching is enabled
+            if self.use_cache:
+                self.entity_cache[cache_key] = entities
+            
             return entities
         except Exception as e:
             print(f"Error parsing response: {e}")
@@ -286,7 +320,7 @@ class EntityExtractor:
 
     def extract_relationships_from_text(self, text, entities):
         """
-        Extract relationships between entities in a text using DeepSeek API
+        Extract relationships between entities in a text using DeepSeek API with caching
         
         Args:
             text: The document text
@@ -295,56 +329,80 @@ class EntityExtractor:
         Returns:
             List of dictionaries with source, target, and relation
         """
-        # Truncate text if it's too long
-        # if len(text) > 4000:
-        #     text = text[:4000] + "..."
+        # Create a cache key based on text and entities
+        entities_str = ",".join(sorted(entities))
+        cache_key = f"rel_{hash(text)}_{hash(entities_str)}"
+        
+        # Check cache first if caching is enabled
+        if self.use_cache and cache_key in self.relationship_cache:
+            if self.verbose:
+                print("Using cached relationships")
+            return self.relationship_cache[cache_key]
         
         # Create a prompt for relationship extraction
         prompt = f"""
         Extract relationships between the following entities in the text:
         
-        Entities: {', '.join(entities)}
+        Entities: {json.dumps(entities)}
         
         Text: {text}
         
-        For each relationship you find, return a JSON object with the following format:
-        {{
-            "source": "entity1",
-            "target": "entity2",
-            "relation": "description of the relationship"
-        }}
+        For each relationship, identify:
+        1. The source entity
+        2. The target entity
+        3. The relationship between them (a short phrase or verb)
         
-        Return your answer as a JSON array of these relationship objects. Only include relationships that are explicitly mentioned in the text.
-        If no relationships are found, return an empty array.
+        Return the results as a JSON array of objects with 'source', 'target', and 'relation' fields.
+        Example: [
+            {{"source": "Entity1", "target": "Entity2", "relation": "works for"}},
+            {{"source": "Entity3", "target": "Entity4", "relation": "is located in"}}
+        ]
+        
+        Only include relationships that are explicitly mentioned in the text.
+        Only include entities from the provided list.
         """
         
         messages = [
-            {"role": "system", "content": "You are a helpful assistant that extracts relationships between entities from text."},
+            {"role": "system", "content": "You are a helpful assistant that extracts relationships between entities."},
             {"role": "user", "content": prompt}
         ]
         
+        response = self.deepseek.generate_response(messages, temperature=0.1)
+        
+        # Extract JSON from response
         try:
-            response = self.deepseek.generate_response(messages, temperature=0.1)
-            
-            # Extract JSON from response
+            # Find JSON in the response
             json_match = re.search(r'\[.*\]', response, re.DOTALL)
             if json_match:
                 json_str = json_match.group(0)
             else:
                 json_str = response
                 
-            # Clean up the string to ensure it's valid JSON
+            # Clean up the string
             json_str = re.sub(r'```.*?```', '', json_str, flags=re.DOTALL)
             json_str = re.sub(r'```json', '', json_str)
             json_str = re.sub(r'```', '', json_str)
             
             # Parse the JSON
             relationships = json.loads(json_str)
-            return relationships
+            
+            # Validate relationships
+            valid_relationships = []
+            for rel in relationships:
+                if 'source' in rel and 'target' in rel and 'relation' in rel:
+                    # Check that source and target are in the entities list
+                    if rel['source'] in entities and rel['target'] in entities:
+                        valid_relationships.append(rel)
+            
+            # Cache the result if caching is enabled
+            if self.use_cache:
+                self.relationship_cache[cache_key] = valid_relationships
+            
+            return valid_relationships
         except Exception as e:
-            print(f"Error extracting relationships: {e}")
+            print(f"Error parsing relationships: {e}")
             print(f"Raw response: {response}")
-            return []
+            return []  # Return empty list on error
 
     def generate_graph_text_representation(self, entity_graph, question_entities):
         """
@@ -471,3 +529,616 @@ class EntityExtractor:
             clean_response = clean_response[:-1]
         
         return clean_response
+
+    def create_entity_document_graph_experiment(self, example, experiment_type="standard", max_workers=5):
+        """Create a bipartite graph with detailed timing and shared caching"""
+        print(f"Running experiment: {experiment_type}")
+        
+        # Extract entities from the question (same for all experiments)
+        print("Extracting entities from question...")
+        question_start = time.time()
+        question_entities = self.extract_entities_from_question(example['question'])
+        if self.verbose:
+            print(f"Question entity extraction took {time.time() - question_start:.2f} seconds")
+        print(f"Entities in question: {question_entities}")
+        
+        # Create a bipartite graph
+        G = nx.Graph()
+        
+        # Add question entities as nodes
+        for entity in question_entities:
+            G.add_node(entity, type='entity')
+        
+        # Pre-extract all paragraph entities to share across experiments
+        if experiment_type in ["standard", "fuzzy_matching", "llm_merging"]:
+            # These experiments all use the same entity extraction, so pre-extract once
+            paragraph_entities = {}
+            
+            print(f"Pre-extracting entities from {len(example['paragraphs'])} paragraphs...")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Create a list to store futures
+                futures = []
+                
+                # Submit tasks for each paragraph
+                for i, paragraph in enumerate(example['paragraphs']):
+                    futures.append(
+                        executor.submit(
+                            self.extract_entities_from_paragraph,
+                            paragraph['paragraph_text']
+                        )
+                    )
+                
+                # Process results as they complete
+                for i, future in enumerate(tqdm(concurrent.futures.as_completed(futures), 
+                                              total=len(futures),
+                                              desc="Pre-extracting entities")):
+                    try:
+                        # Get the paragraph and its entities
+                        paragraph = example['paragraphs'][i]
+                        entities = future.result()
+                        paragraph_entities[i] = entities
+                        
+                    except Exception as e:
+                        print(f"Error pre-extracting paragraph {i}: {e}")
+            
+            # Now choose the appropriate experiment implementation with pre-extracted entities
+            if experiment_type == "fuzzy_matching":
+                return self._experiment_fuzzy_matching(G, example, question_entities, paragraph_entities)
+            elif experiment_type == "llm_merging":
+                return self._experiment_llm_merging(G, example, question_entities, paragraph_entities)
+            else:  # standard approach
+                return self._experiment_standard(G, example, question_entities, paragraph_entities)
+        else:
+            # Sequential context needs to process paragraphs in order
+            return self._experiment_sequential_context(G, example, question_entities)
+
+    def _experiment_standard(self, G, example, question_entities, paragraph_entities):
+        """
+        Standard approach: use pre-extracted entities
+        """
+        print(f"Processing {len(example['paragraphs'])} paragraphs with pre-extracted entities...")
+        
+        # Process each paragraph with pre-extracted entities
+        for i, paragraph in enumerate(tqdm(example['paragraphs'], desc="Processing paragraphs")):
+            try:
+                # Get the pre-extracted entities
+                entities = paragraph_entities[i]
+                
+                # Create document node
+                doc_id = f"doc_{i}"
+                G.add_node(doc_id, 
+                          type='document', 
+                          title=paragraph['title'], 
+                          text=paragraph['paragraph_text'],
+                          is_supporting=paragraph.get('is_supporting', False))
+                
+                # Connect entities to document
+                for entity in entities:
+                    G.add_node(entity, type='entity')
+                    G.add_edge(entity, doc_id)
+                    
+            except Exception as e:
+                print(f"Error processing paragraph {i}: {e}")
+        
+        return G, question_entities
+
+    def _experiment_fuzzy_matching(self, G, example, question_entities, paragraph_entities):
+        """
+        Fuzzy matching approach: use pre-extracted entities and fuzzy string matching to merge similar entities
+        """
+        print(f"Processing {len(example['paragraphs'])} paragraphs with fuzzy matching...")
+        
+        # Collect all entities for fuzzy matching
+        all_entities = set(question_entities)
+        for entities in paragraph_entities.values():
+            all_entities.update(entities)
+        
+        # Create entity mapping using fuzzy matching
+        entity_mapping = self._merge_entities_with_fuzzy_matching(list(all_entities))
+        
+        # Process each paragraph with pre-extracted entities and apply mapping
+        for i, paragraph in enumerate(tqdm(example['paragraphs'], desc="Processing paragraphs")):
+            try:
+                # Get the pre-extracted entities and map them
+                entities = paragraph_entities[i]
+                mapped_entities = [entity_mapping.get(entity, entity) for entity in entities]
+                
+                # Create document node
+                doc_id = f"doc_{i}"
+                G.add_node(doc_id, 
+                          type='document', 
+                          title=paragraph['title'], 
+                          text=paragraph['paragraph_text'],
+                          is_supporting=paragraph.get('is_supporting', False))
+                
+                # Connect mapped entities to document
+                for entity in mapped_entities:
+                    G.add_node(entity, type='entity')
+                    G.add_edge(entity, doc_id)
+                    
+            except Exception as e:
+                print(f"Error processing paragraph {i}: {e}")
+        
+        # Map question entities
+        mapped_question_entities = [entity_mapping.get(entity, entity) for entity in question_entities]
+        
+        return G, mapped_question_entities
+
+    def _experiment_llm_merging(self, G, example, question_entities, paragraph_entities):
+        """
+        LLM merging approach: use pre-extracted entities and LLM to merge equivalent entities
+        """
+        print(f"Processing {len(example['paragraphs'])} paragraphs with LLM merging...")
+        
+        # Collect all entities for LLM merging
+        all_entities = set(question_entities)
+        for entities in paragraph_entities.values():
+            all_entities.update(entities)
+        
+        # Use LLM to merge entities
+        entity_mapping = self.merge_equivalent_entities_with_llm(list(all_entities))
+        
+        # Process each paragraph with pre-extracted entities and apply mapping
+        for i, paragraph in enumerate(tqdm(example['paragraphs'], desc="Processing paragraphs")):
+            try:
+                # Get the pre-extracted entities and map them
+                entities = paragraph_entities[i]
+                mapped_entities = [entity_mapping.get(entity, entity) for entity in entities]
+                
+                # Create document node
+                doc_id = f"doc_{i}"
+                G.add_node(doc_id, 
+                          type='document', 
+                          title=paragraph['title'], 
+                          text=paragraph['paragraph_text'],
+                          is_supporting=paragraph.get('is_supporting', False))
+                
+                # Connect mapped entities to document
+                for entity in mapped_entities:
+                    G.add_node(entity, type='entity')
+                    G.add_edge(entity, doc_id)
+                    
+            except Exception as e:
+                print(f"Error processing paragraph {i}: {e}")
+        
+        # Map question entities
+        mapped_question_entities = [entity_mapping.get(entity, entity) for entity in question_entities]
+        
+        return G, mapped_question_entities
+
+    def merge_equivalent_entities_with_llm(self, entities):
+        """
+        Use LLM to identify and merge equivalent entities
+        
+        Args:
+            entities: List of entities to check for equivalence
+            
+        Returns:
+            Dictionary mapping original entities to canonical forms
+        """
+        # Skip if there are too few entities
+        if len(entities) < 2:
+            return {}
+        
+        # Create a more precise prompt with clear instructions and examples
+        prompt = f"""
+        I have extracted the following entities from a set of documents:
+        {json.dumps(entities, indent=2)}
+        
+        I need to identify entities that refer to the exact same real-world object, person, or concept but are written differently.
+        
+        IMPORTANT GUIDELINES:
+        1. ONLY merge entities that are truly the same entity with different names/spellings
+        2. DO NOT merge entities that are merely related or in the same category
+        3. DO NOT merge specific entities into broader categories
+        4. DO NOT merge people with organizations they belong to
+        5. DO NOT merge movies/books with their creators or characters
+        6. Maintain the most specific and accurate form as the canonical entity
+        
+        Examples of correct merging:
+        - "NYC" → "New York City" (different names for the same city)
+        - "Barack Obama" → "President Obama" (same person, different references)
+        - "IBM" → "International Business Machines" (same company, full vs. acronym)
+        
+        Examples of INCORRECT merging:
+        - "Jennifer Garner" → "Walt Disney Pictures" (an actress is not a studio)
+        - "Green Party" → "Citizens Party" (different political parties)
+        - "Grant Green" → "Green Album" (a person is not an album)
+        
+        Return your answer as a JSON object where:
+        - Keys are the original entities
+        - Values are the canonical forms (choose the most complete/accurate form)
+        
+        Only include entities that should be merged. If an entity has no equivalent, don't include it.
+        """
+        
+        messages = [
+            {"role": "system", "content": "You are a precise entity resolution specialist. Your task is to identify when two differently written entities refer to exactly the same real-world entity. Be extremely conservative - only merge entities when you are certain they are the same."},
+            {"role": "user", "content": prompt}
+        ]
+        
+        print("Using LLM to merge equivalent entities...")
+        # Use a low temperature for more precise, deterministic results
+        response = self.deepseek.generate_response(messages, temperature=0.1)
+        
+        # Extract JSON from response
+        try:
+            # Find JSON in the response
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(0)
+            else:
+                json_str = response
+                
+            # Clean up the string
+            json_str = re.sub(r'```.*?```', '', json_str, flags=re.DOTALL)
+            json_str = re.sub(r'```json', '', json_str)
+            json_str = re.sub(r'```', '', json_str)
+            
+            # Parse the JSON
+            entity_mapping = json.loads(json_str)
+            
+            # Validate the mappings - ensure we're not doing crazy merges
+            validated_mapping = {}
+            for original, canonical in entity_mapping.items():
+                # Skip if the original and canonical are the same
+                if original == canonical:
+                    continue
+                    
+                # Skip if the similarity is too low (likely incorrect merge)
+                similarity = SequenceMatcher(None, original.lower(), canonical.lower()).ratio()
+                if similarity < 0.3:  # Threshold for minimum similarity
+                    print(f"  Rejected mapping: '{original}' → '{canonical}' (similarity: {similarity:.2f})")
+                    continue
+                    
+                # Accept the mapping
+                validated_mapping[original] = canonical
+            
+            # Print the mappings
+            if validated_mapping:
+                print("Entity mappings:")
+                for original, canonical in validated_mapping.items():
+                    print(f"  '{original}' → '{canonical}'")
+            else:
+                print("No valid entity mappings found.")
+            
+            return validated_mapping
+        except Exception as e:
+            print(f"Error parsing entity mapping: {e}")
+            print(f"Raw response: {response}")
+            return {}  # Return empty mapping on error
+
+    def _experiment_sequential_context(self, G, example, question_entities):
+        """
+        Sequential context approach: extracts entities sequentially with context from previous extractions
+        """
+        print(f"Processing {len(example['paragraphs'])} paragraphs sequentially with context...")
+        
+        # Start with question entities as the initial context
+        known_entities = set(question_entities)
+        
+        # Process paragraphs sequentially
+        for i, paragraph in enumerate(tqdm(example['paragraphs'], desc="Extracting entities sequentially")):
+            doc_id = f"doc_{i}"
+            
+            # Extract entities with context
+            entities = self._extract_entities_with_context(
+                paragraph['paragraph_text'], 
+                list(known_entities)
+            )
+            
+            # Update known entities
+            known_entities.update(entities)
+            
+            # Add document node
+            G.add_node(doc_id, 
+                      type='document', 
+                      title=paragraph['title'], 
+                      text=paragraph['paragraph_text'],
+                      is_supporting=paragraph.get('is_supporting', False))
+            
+            # Print entities found in this paragraph
+            print(f"Paragraph {i} ({paragraph['title']}): {entities}")
+            
+            # Connect entities to document
+            for entity in entities:
+                G.add_node(entity, type='entity')
+                G.add_edge(entity, doc_id)
+        
+        return G, question_entities
+
+    def _extract_entities_with_context(self, text, known_entities):
+        """
+        Extract entities from text with context from previously known entities
+        
+        Args:
+            text: The text to extract entities from
+            known_entities: List of entities already identified
+            
+        Returns:
+            List of entities found in the text
+        """
+        # Create the prompt with context
+        prompt = f"""
+        Extract all entities from the following paragraph:
+        
+        Paragraph: {text}
+        
+        An entity is a real-world object such as a person, location, organization, product, etc.
+        
+        Here are some entities that have already been identified in related texts:
+        {json.dumps(known_entities, indent=2)}
+        
+        Please identify:
+        1. Any of the above entities that appear in this paragraph
+        2. New entities that haven't been identified yet
+        
+        Return only a JSON array of entity names, with no additional text.
+        Example: ["Entity1", "Entity2", "Entity3"]
+        """
+        
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant that extracts entities from text."},
+            {"role": "user", "content": prompt}
+        ]
+        
+        response = self.deepseek.generate_response(messages, temperature=0.1)
+        
+        # Extract JSON from response
+        try:
+            # Find JSON in the response
+            json_match = re.search(r'\[.*\]', response, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(0)
+            else:
+                json_str = response
+                
+            # Clean up the string
+            json_str = re.sub(r'```.*?```', '', json_str, flags=re.DOTALL)
+            json_str = re.sub(r'```json', '', json_str)
+            json_str = re.sub(r'```', '', json_str)
+            
+            # Parse the JSON
+            entities = json.loads(json_str)
+            return entities
+        except Exception as e:
+            print(f"Error parsing entities: {e}")
+            print(f"Raw response: {response}")
+            return []  # Return empty list on error
+
+    def _merge_entities_with_fuzzy_matching(self, entities, threshold=0.85):
+        """
+        Use fuzzy string matching to identify and merge equivalent entities
+        
+        Args:
+            entities: List of entities to check for equivalence
+            threshold: Similarity threshold for merging (0.0 to 1.0)
+            
+        Returns:
+            Dictionary mapping original entities to canonical forms
+        """
+        # Skip if there are too few entities
+        if len(entities) < 2:
+            return {}
+        
+        # Sort entities by length for better canonical selection
+        sorted_entities = sorted(entities, key=len, reverse=True)
+        
+        # Create mapping dictionary
+        entity_mapping = {}
+        
+        # Compare each entity with all others
+        for i, entity1 in enumerate(sorted_entities):
+            # Skip if this entity is already mapped to something else
+            if entity1 in entity_mapping:
+                continue
+            
+            for entity2 in sorted_entities[i+1:]:
+                # Skip if entity2 is already mapped
+                if entity2 in entity_mapping:
+                    continue
+                
+                # Calculate similarity
+                similarity = SequenceMatcher(None, entity1.lower(), entity2.lower()).ratio()
+                
+                # If similarity is above threshold, map entity2 to entity1
+                if similarity >= threshold:
+                    entity_mapping[entity2] = entity1
+        
+        # Print the mappings
+        if entity_mapping:
+            print("Entity mappings from fuzzy matching:")
+            for original, canonical in entity_mapping.items():
+                print(f"  '{original}' → '{canonical}' (similarity: {SequenceMatcher(None, original.lower(), canonical.lower()).ratio():.2f})")
+        else:
+            print("No entity mappings found with fuzzy matching.")
+        
+        return entity_mapping
+
+    def apply_standard_experiment(self, G, example, question_entities, paragraph_entities):
+        """
+        Apply the standard experiment to the graph using pre-extracted entities
+        
+        Args:
+            G: The initial graph with question entities
+            example: The example data
+            question_entities: Entities from the question
+            paragraph_entities: Pre-extracted entities from paragraphs
+            
+        Returns:
+            The updated graph
+        """
+        print(f"Processing {len(example['paragraphs'])} paragraphs with standard approach...")
+        
+        # Process each paragraph with pre-extracted entities
+        for i, paragraph in enumerate(tqdm(example['paragraphs'], desc="Processing paragraphs")):
+            try:
+                # Get the pre-extracted entities
+                entities = paragraph_entities[i]
+                
+                # Create document node
+                doc_id = f"doc_{i}"
+                G.add_node(doc_id, 
+                          type='document', 
+                          title=paragraph['title'], 
+                          text=paragraph['paragraph_text'],
+                          is_supporting=paragraph.get('is_supporting', False))
+                
+                # Connect entities to document
+                for entity in entities:
+                    G.add_node(entity, type='entity')
+                    G.add_edge(entity, doc_id)
+                    
+            except Exception as e:
+                print(f"Error processing paragraph {i}: {e}")
+        
+        return G
+
+    def apply_fuzzy_matching_experiment(self, G, example, question_entities, paragraph_entities):
+        """
+        Apply the fuzzy matching experiment to the graph using pre-extracted entities
+        
+        Args:
+            G: The initial graph with question entities
+            example: The example data
+            question_entities: Entities from the question
+            paragraph_entities: Pre-extracted entities from paragraphs
+            
+        Returns:
+            Tuple of (updated graph, mapped question entities)
+        """
+        print(f"Processing {len(example['paragraphs'])} paragraphs with fuzzy matching...")
+        
+        # Collect all entities for fuzzy matching
+        all_entities = set(question_entities)
+        for entities in paragraph_entities.values():
+            all_entities.update(entities)
+        
+        # Create entity mapping using fuzzy matching
+        entity_mapping = self._merge_entities_with_fuzzy_matching(list(all_entities))
+        
+        # Process each paragraph with pre-extracted entities and apply mapping
+        for i, paragraph in enumerate(tqdm(example['paragraphs'], desc="Processing paragraphs")):
+            try:
+                # Get the pre-extracted entities and map them
+                entities = paragraph_entities[i]
+                mapped_entities = [entity_mapping.get(entity, entity) for entity in entities]
+                
+                # Create document node
+                doc_id = f"doc_{i}"
+                G.add_node(doc_id, 
+                          type='document', 
+                          title=paragraph['title'], 
+                          text=paragraph['paragraph_text'],
+                          is_supporting=paragraph.get('is_supporting', False))
+                
+                # Connect mapped entities to document
+                for entity in mapped_entities:
+                    G.add_node(entity, type='entity')
+                    G.add_edge(entity, doc_id)
+                    
+            except Exception as e:
+                print(f"Error processing paragraph {i}: {e}")
+        
+        # Map question entities
+        mapped_question_entities = [entity_mapping.get(entity, entity) for entity in question_entities]
+        
+        return G, mapped_question_entities
+
+    def apply_llm_merging_experiment(self, G, example, question_entities, paragraph_entities):
+        """
+        Apply the LLM merging experiment to the graph using pre-extracted entities
+        
+        Args:
+            G: The initial graph with question entities
+            example: The example data
+            question_entities: Entities from the question
+            paragraph_entities: Pre-extracted entities from paragraphs
+            
+        Returns:
+            Tuple of (updated graph, mapped question entities)
+        """
+        print(f"Processing {len(example['paragraphs'])} paragraphs with LLM merging...")
+        
+        # Collect all entities for LLM merging
+        all_entities = set(question_entities)
+        for entities in paragraph_entities.values():
+            all_entities.update(entities)
+        
+        # Use LLM to merge entities
+        entity_mapping = self.merge_equivalent_entities_with_llm(list(all_entities))
+        
+        # Process each paragraph with pre-extracted entities and apply mapping
+        for i, paragraph in enumerate(tqdm(example['paragraphs'], desc="Processing paragraphs")):
+            try:
+                # Get the pre-extracted entities and map them
+                entities = paragraph_entities[i]
+                mapped_entities = [entity_mapping.get(entity, entity) for entity in entities]
+                
+                # Create document node
+                doc_id = f"doc_{i}"
+                G.add_node(doc_id, 
+                          type='document', 
+                          title=paragraph['title'], 
+                          text=paragraph['paragraph_text'],
+                          is_supporting=paragraph.get('is_supporting', False))
+                
+                # Connect mapped entities to document
+                for entity in mapped_entities:
+                    G.add_node(entity, type='entity')
+                    G.add_edge(entity, doc_id)
+                    
+            except Exception as e:
+                print(f"Error processing paragraph {i}: {e}")
+        
+        # Map question entities
+        mapped_question_entities = [entity_mapping.get(entity, entity) for entity in question_entities]
+        
+        return G, mapped_question_entities
+
+    def apply_sequential_context_experiment(self, G, example, question_entities):
+        """
+        Apply the sequential context experiment to the graph
+        
+        Args:
+            G: The initial graph with question entities
+            example: The example data
+            question_entities: Entities from the question
+            
+        Returns:
+            Tuple of (updated graph, question entities)
+        """
+        print(f"Processing {len(example['paragraphs'])} paragraphs sequentially with context...")
+        
+        # Start with question entities as the initial context
+        known_entities = set(question_entities)
+        
+        # Process paragraphs sequentially
+        for i, paragraph in enumerate(tqdm(example['paragraphs'], desc="Extracting entities sequentially")):
+            doc_id = f"doc_{i}"
+            
+            # Extract entities with context
+            entities = self._extract_entities_with_context(
+                paragraph['paragraph_text'], 
+                list(known_entities)
+            )
+            
+            # Update known entities
+            known_entities.update(entities)
+            
+            # Add document node
+            G.add_node(doc_id, 
+                      type='document', 
+                      title=paragraph['title'], 
+                      text=paragraph['paragraph_text'],
+                      is_supporting=paragraph.get('is_supporting', False))
+            
+            # Print entities found in this paragraph
+            print(f"Paragraph {i} ({paragraph['title']}): {entities}")
+            
+            # Connect entities to document
+            for entity in entities:
+                G.add_node(entity, type='entity')
+                G.add_edge(entity, doc_id)
+        
+        return G, question_entities
