@@ -568,22 +568,27 @@ def main():
     parser.add_argument('--dataset-path', type=str, help='Path to the MuSiQue dataset')
     parser.add_argument('--list-examples', action='store_true', help='List available example IDs')
     parser.add_argument('--max-hops', type=int, default=10, help='Maximum number of hops for document retrieval')
-    parser.add_argument('--max-workers', type=int, default=5, help='Maximum number of parallel workers for API calls')
+    parser.add_argument('--max-workers', type=int, default=1, help='Maximum number of parallel workers for API calls')
     parser.add_argument('--skip-bipartite', action='store_true', help='Skip bipartite graph visualization')
     parser.add_argument('--skip-visualization', action='store_true', help='Skip all visualizations')
     parser.add_argument('--experiment', type=str, choices=['standard', 'fuzzy_matching', 'llm_merging', 'sequential_context', 'all'],
                        default='standard', help='Entity extraction experiment to run')
     parser.add_argument('--batch', action='store_true', help='Run batch processing on multiple examples')
     parser.add_argument('--batch-size', type=int, default=5, help='Number of examples to process in batch mode')
-    parser.add_argument('--max-parallel', type=int, default=2, help='Maximum number of examples to process in parallel')
+    parser.add_argument('--max-parallel', type=int, default=1, help='Maximum number of examples to process in parallel')
     parser.add_argument('--example-ids', type=str, help='Comma-separated list of example IDs to process in batch mode')
     parser.add_argument('--random-sample', action='store_true', help='Use random sampling for batch processing')
-    parser.add_argument('--max-api-concurrency', type=int, default=10, 
+    parser.add_argument('--max-api-concurrency', type=int, default=1, 
                        help='Maximum number of concurrent API requests across all processes')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output with detailed timing information')
     parser.add_argument('--profile', action='store_true', help='Enable profiling for performance analysis')
     parser.add_argument('--model', type=str, default="deepseek-chat", 
-                       choices=["deepseek-chat", "gpt-4o-mini", "gpt-3.5-turbo"],
+                       choices=["deepseek-chat", "gpt-4o-mini", "gpt-3.5-turbo", 
+                               "local:TheBloke/Llama-2-7B-Chat-GPTQ",
+                               "local:TheBloke/Mistral-7B-Instruct-v0.2-GPTQ",
+                               "local:TheBloke/Mixtral-8x7B-Instruct-v0.1-GPTQ",
+                               "local:Qwen/Qwen2.5-0.5B",
+                               "local:Qwen/Qwen2.5-1.5B"],
                        help='Model to use for API calls')
     parser.add_argument('--show-usage', action='store_true', help='Show current API usage statistics')
     parser.add_argument('--disable-cache', action='store_true', help='Disable caching of API responses')

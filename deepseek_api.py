@@ -6,6 +6,7 @@ import threading
 from langchain_openai.chat_models.base import BaseChatOpenAI
 from langchain.schema import HumanMessage, SystemMessage
 from rate_limiter import get_rate_limiter
+from local_llm import LocalLLM
 
 # Load environment variables
 load_dotenv()
@@ -30,32 +31,50 @@ class DeepSeekAPI:
             model_name: The model to use. Options:
                 - "deepseek-chat": DeepSeek's chat model
                 - "gpt-4o-mini": OpenAI's GPT-4o-mini model
+                - "local:MODEL_NAME": Local model using Transformers (e.g., "local:TheBloke/Llama-2-7B-Chat-GPTQ")
                 - Any other OpenAI model name
         """
         self.model_name = model_name
+        
+        # Check if using local model
+        self.is_local = model_name.startswith("local:")
         
         # Check if using DeepSeek or OpenAI
         self.is_deepseek = "deepseek" in model_name.lower()
         
         # Get appropriate API key
-        if self.is_deepseek:
+        if self.is_local:
+            # For local models, extract the actual model name
+            self.local_model_name = model_name.split(":", 1)[1] if ":" in model_name else "TheBloke/Llama-2-7B-Chat-GPTQ"
+            # Initialize local LLM
+            self.local_llm = LocalLLM(model_name_or_path=self.local_model_name)
+            self.llm = None  # No need for LangChain model
+        elif self.is_deepseek:
             self.api_key = os.environ.get("DEEPSEEK_API_KEY")
             if not self.api_key:
                 raise ValueError("DEEPSEEK_API_KEY environment variable not set")
             api_base = 'https://api.deepseek.com'
+            
+            # Initialize the LangChain model
+            self.llm = BaseChatOpenAI(
+                model=model_name,
+                openai_api_key=self.api_key,
+                openai_api_base=api_base,
+                request_timeout=60  # Increase timeout to 60 seconds
+            )
         else:
             self.api_key = os.environ.get("OPENAI_API_KEY")
             if not self.api_key:
                 raise ValueError("OPENAI_API_KEY environment variable not set")
             api_base = None  # Use default OpenAI base URL
-        
-        # Initialize the LangChain model
-        self.llm = BaseChatOpenAI(
-            model=model_name,
-            openai_api_key=self.api_key,
-            openai_api_base=api_base,
-            request_timeout=60  # Increase timeout to 60 seconds
-        )
+            
+            # Initialize the LangChain model
+            self.llm = BaseChatOpenAI(
+                model=model_name,
+                openai_api_key=self.api_key,
+                openai_api_base=api_base,
+                request_timeout=60  # Increase timeout to 60 seconds
+            )
     
     def generate_response(self, messages, temperature=0.7, max_retries=3, retry_delay=2):
         """
@@ -70,6 +89,15 @@ class DeepSeekAPI:
         Returns:
             Generated text response
         """
+        # For local models, use direct generation without rate limiting
+        if self.is_local:
+            try:
+                return self.local_llm.generate(messages, temperature=temperature)
+            except Exception as e:
+                print(f"Error generating with local model: {e}")
+                return f"Error: {str(e)}"
+        
+        # For API models, use rate limiting and retries
         retry_count = 0
         while retry_count < max_retries:
             # Check rate limits
