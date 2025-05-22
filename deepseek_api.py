@@ -119,6 +119,7 @@ class DeepSeekAPI:
                 
                 # Set temperature
                 self.llm.temperature = temperature
+                self.llm.temperature = 0.3
                 
                 # Generate response
                 response = self.llm.invoke(langchain_messages)

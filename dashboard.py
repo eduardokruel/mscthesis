@@ -6,16 +6,23 @@ import matplotlib.pyplot as plt
 from PIL import Image
 import glob
 import numpy as np
-from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
+from sklearn.metrics import precision_score, recall_score, f1_score as sklearn_f1_score, accuracy_score
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
+import nltk
 
 # Set page configuration
 st.set_page_config(page_title="MuSiQue Experiment Dashboard", layout="wide")
 
 # Title and description
 st.title("MuSiQue Experiment Dashboard")
+
+# Add this near the top of the file, after imports
+try:
+    nltk.data.find('corpora/wordnet')
+except LookupError:
+    nltk.download('wordnet')
 
 # Function to load results directory
 def load_results_directory():
@@ -57,7 +64,8 @@ def calculate_doc_metrics(reachable_docs, supporting_docs, all_docs):
     # Calculate metrics
     precision = precision_score(y_true, y_pred, zero_division=0)
     recall = recall_score(y_true, y_pred, zero_division=0)
-    f1 = f1_score(y_true, y_pred, zero_division=0)
+    # Rename the imported function to avoid conflict
+    f1 = sklearn_f1_score(y_true, y_pred, zero_division=0)
     accuracy = accuracy_score(y_true, y_pred)
     
     return {
@@ -132,6 +140,17 @@ if os.path.exists(question_info_path):
     
     st.subheader("Reference Answer")
     st.write(question_info.get("answer", "Answer not found"))
+    
+    # Display dataset-specific information
+    dataset_type = question_info.get("dataset_type", "musique")
+    st.write(f"**Dataset:** {dataset_type.upper()}")
+    
+    if dataset_type.lower() == 'hotpotqa':
+        # Display HotpotQA specific fields
+        if 'type' in question_info:
+            st.write(f"**Question Type:** {question_info['type']}")
+        if 'level' in question_info:
+            st.write(f"**Difficulty Level:** {question_info['level']}")
 
 # Display selected experiment
 exp_dir = os.path.join(experiment_dir, selected_experiment)
@@ -147,6 +166,26 @@ if os.path.exists(results_path):
     answer = results.get("generated_answer", results.get("answer", "Answer not found"))
     st.write(answer)
     
+    # Add exact match information
+    if "exact_match" in results:
+        exact_match = results["exact_match"]
+        st.subheader(f"Exact Match: {'Yes' if exact_match else 'No'}")
+        
+        # Display extracted answer if available
+        if "extracted_answer" in results:
+            st.write(f"**Extracted Answer:** {results['extracted_answer']}")
+        
+        # Display normalized forms
+        if "normalized_prediction" in results and "normalized_reference" in results:
+            st.write(f"**Normalized Prediction:** {results['normalized_prediction']}")
+            st.write(f"**Normalized Reference:** {results['normalized_reference']}")
+        
+        # Add display of best matching alias if available
+        if "best_matching_alias" in results and results["best_matching_alias"] != results.get("reference_answer", ""):
+            st.write(f"**Best Matching Alias:** {results['best_matching_alias']}")
+            if "best_matching_alias_normalized" in results:
+                st.write(f"**Normalized Alias:** {results['best_matching_alias_normalized']}")
+
     # Display similarity score - check multiple possible field names
     similarity = results.get("similarity_score", results.get("similarity", 0))
     st.subheader(f"Similarity Score: {similarity:.2f}")
@@ -165,7 +204,69 @@ if os.path.exists(results_path):
     # Display total execution time if available
     if "execution_time" in results:
         st.subheader("Total Execution Time")
-        st.write(f"{results['execution_time']:.2f} seconds")
+        timing_dict = results.get("timing", {})
+        if timing_dict and all(isinstance(v, (int, float)) for v in timing_dict.values()):
+            execution_time = results.get("execution_time", sum(timing_dict.values()))
+        else:
+            execution_time = results.get("execution_time", 0)
+        st.write(f"{execution_time:.2f} seconds")
+
+    # Add a new section to display all accepted aliases
+    if "reference_answer" in results:
+        reference_answer = results["reference_answer"]
+        
+        try:
+            # Create an evaluator to get aliases
+            from evaluation import AnswerEvaluator
+            evaluator = AnswerEvaluator()
+            aliases = evaluator.get_aliases(reference_answer)
+            
+            if aliases and len(aliases) > 1:  # Only show if there are aliases beyond the original answer
+                with st.expander("View Accepted Answer Aliases"):
+                    st.write("The following alternative forms of the answer are accepted:")
+                    for alias in aliases:
+                        if alias != reference_answer:  # Don't show the original answer again
+                            st.write(f"- {alias}")
+        except Exception as e:
+            st.warning(f"Could not load answer aliases: {str(e)}")
+
+    # After the exact match section
+    if "partial_match" in results:
+        partial_match = results["partial_match"]
+        if partial_match and not exact_match:  # Only show if it's a partial match but not an exact match
+            st.subheader(f"Partial Match: Yes")
+            
+            # Display F1 score if available
+            if "f1_score" in results:
+                f1_score = results["f1_score"]
+                st.write(f"**F1 Score:** {f1_score:.2f}")
+                
+                # Show precision and recall
+                if "precision" in results and "recall" in results:
+                    st.write(f"**Precision:** {results['precision']:.2f}")
+                    st.write(f"**Recall:** {results['recall']:.2f}")
+            
+            # Display substring relationship if available
+            if "is_substring" in results and results["is_substring"]:
+                st.write("**Note:** One answer is a substring of the other")
+
+    # Add F1 score visualization
+    if "f1_score" in results:
+        f1_score = results["f1_score"]
+        st.subheader(f"F1 Score: {f1_score:.2f}")
+        
+        # Create a progress bar for F1 score
+        st.progress(f1_score)
+        
+        # Add color coding based on partial match criteria
+        if f1_score > 0.8:
+            st.success("High token overlap (F1 > 0.8)")
+        elif f1_score > 0.6 and results.get("is_substring", False):
+            st.success("Good token overlap (F1 > 0.6) with substring relationship")
+        elif f1_score > 0.5:
+            st.warning("Moderate token overlap")
+        else:
+            st.error("Low token overlap")
 
 # Create tabs for visualizations
 viz_tabs = st.tabs(["Entity-Document Graph", "Entity Relationship Graph", "Document Analysis"])
@@ -367,7 +468,11 @@ if st.sidebar.checkbox("Show Experiment Comparison", value=True):
             
             # Check for different field names
             similarity = results.get("similarity_score", results.get("similarity", 0))
-            execution_time = results.get("execution_time", sum(results.get("timing", {}).values()))
+            timing_dict = results.get("timing", {})
+            if timing_dict and all(isinstance(v, (int, float)) for v in timing_dict.values()):
+                execution_time = results.get("execution_time", sum(timing_dict.values()))
+            else:
+                execution_time = results.get("execution_time", 0)
             
             comparison_data[exp_type] = {
                 "similarity": similarity,
@@ -474,11 +579,15 @@ if st.sidebar.checkbox("Show Experiment Comparison", value=True):
 if st.sidebar.checkbox("Show Batch Statistics", value=True):
     st.header("Batch Statistics")
     
-    # Try to load batch_results.json first
+    # Load batch_results.json if available
     batch_results_path = os.path.join("results", selected_batch, "batch_results.json")
+    batch_results_available = False
+    
     if os.path.exists(batch_results_path):
         with open(batch_results_path, "r") as f:
             batch_results = json.load(f)
+        
+        batch_results_available = True
         
         st.subheader("Batch Summary")
         st.write(f"Total examples: {batch_results.get('total', 0)}")
@@ -489,7 +598,16 @@ if st.sidebar.checkbox("Show Batch Statistics", value=True):
         all_experiment_results = []
         for example_result in batch_results.get('results', []):
             example_id = example_result.get('example_id')
-            results = example_result.get('results', {}).get('results', [])
+            if isinstance(example_result, dict):
+                example_timing = example_result.get('timing_data', {})
+                results = example_result.get('results', [])
+            elif isinstance(example_result, list):
+                # If it's a list, we don't have timing data in this format
+                example_timing = {}
+                results = example_result
+            else:
+                example_timing = {}
+                results = []
             
             for exp_result in results:
                 exp_result['example_id'] = example_id
@@ -539,7 +657,7 @@ if st.sidebar.checkbox("Show Batch Statistics", value=True):
             results_df = pd.DataFrame(all_experiment_results)
             
             # Display experiment statistics
-            st.subheader("Experiment Statistics")
+            st.subheader("Experiment Statistics from Batch Results")
             
             # Group by experiment type
             if 'experiment' in results_df.columns:
@@ -660,66 +778,268 @@ if st.sidebar.checkbox("Show Batch Statistics", value=True):
             # Display timing data
             st.subheader("Timing Data by Experiment")
             
-            # Extract timing data
-            timing_data = {}
-            for example_result in batch_results.get('results', []):
-                example_timing = example_result.get('results', {}).get('timing_data', {})
-                for exp_type, times in example_timing.items():
-                    if exp_type not in timing_data:
-                        timing_data[exp_type] = {}
-                    
-                    for step, time_value in times.items():
-                        if step not in timing_data[exp_type]:
-                            timing_data[exp_type][step] = []
-                        
-                        timing_data[exp_type][step].append(time_value)
-            
-            # Create timing summary
-            timing_summary = {}
-            for exp_type, steps in timing_data.items():
-                timing_summary[exp_type] = {}
-                for step, times in steps.items():
-                    timing_summary[exp_type][step] = {
-                        'mean': sum(times) / len(times),
-                        'total': sum(times),
-                        'min': min(times),
-                        'max': max(times)
-                    }
-            
             # Display timing summary
-            for exp_type, steps in timing_summary.items():
+            for exp_type, steps in example_timing.items():
                 st.write(f"**{exp_type.replace('_', ' ').title()}**")
                 
-                timing_df = pd.DataFrame([
-                    {
-                        'Step': step,
-                        'Mean Time (s)': data['mean'],
-                        'Total Time (s)': data['total'],
-                        'Min Time (s)': data['min'],
-                        'Max Time (s)': data['max']
-                    }
-                    for step, data in steps.items()
-                ])
-                
-                st.dataframe(timing_df)
-                
-                # Create bar chart of mean times
-                chart_data = pd.DataFrame({
-                    'Step': list(steps.keys()),
-                    'Mean Time (s)': [data['mean'] for data in steps.values()]
-                })
-                st.bar_chart(chart_data.set_index('Step'))
+                # Check if the timing data is in the new format (direct float values)
+                if isinstance(next(iter(steps.values()), None), (int, float)):
+                    # New format - direct values
+                    timing_df = pd.DataFrame([
+                        {
+                            'Step': step,
+                            'Time (s)': time_value
+                        }
+                        for step, time_value in steps.items()
+                    ])
+                    
+                    st.dataframe(timing_df)
+                    
+                    # Create bar chart of times
+                    chart_data = pd.DataFrame({
+                        'Step': list(steps.keys()),
+                        'Time (s)': list(steps.values())
+                    })
+                    st.bar_chart(chart_data.set_index('Step'))
+                else:
+                    # Old format - dictionaries with mean, total, etc.
+                    timing_df = pd.DataFrame([
+                        {
+                            'Step': step,
+                            'Mean Time (s)': data['mean'],
+                            'Total Time (s)': data['total'],
+                            'Min Time (s)': data['min'],
+                            'Max Time (s)': data['max']
+                        }
+                        for step, data in steps.items()
+                    ])
+                    
+                    st.dataframe(timing_df)
+                    
+                    # Create bar chart of mean times
+                    chart_data = pd.DataFrame({
+                        'Step': list(steps.keys()),
+                        'Mean Time (s)': [data['mean'] for data in steps.values()]
+                    })
+                    st.bar_chart(chart_data.set_index('Step'))
         
         # Display raw results
         if st.checkbox("Show Raw Batch Results", value=False):
             st.subheader("Raw Batch Results")
             st.json(batch_results)
     
-    # Fall back to experiment_statistics.csv if batch_results.json is not available
-    else:
-        batch_stats_path = os.path.join("results", selected_batch, "experiment_statistics.csv")
-        if os.path.exists(batch_stats_path):
-            stats_df = pd.read_csv(batch_stats_path)
-            st.dataframe(stats_df)
+    # Also check for experiment_statistics.csv
+    batch_stats_path = os.path.join("results", selected_batch, "experiment_statistics.csv")
+    if os.path.exists(batch_stats_path):
+        # Read the statistics CSV file
+        stats_df = pd.read_csv(batch_stats_path)
+        
+        # Add a separator if we already displayed batch_results.json data
+        if batch_results_available:
+            st.markdown("---")
+            st.subheader("Additional Experiment Statistics")
+        
+        # Check if the statistics are in the new format (with 'statistics' column as JSON)
+        if 'statistics' in stats_df.columns:
+            # Parse the statistics JSON column
+            try:
+                # Convert the statistics column from string to dictionary
+                stats_df['statistics'] = stats_df['statistics'].apply(lambda x: eval(x) if isinstance(x, str) else x)
+                
+                # Create a new DataFrame with the statistics expanded
+                expanded_stats = pd.DataFrame()
+                expanded_stats['experiment'] = stats_df['experiment']
+                
+                # Extract each statistic into its own column
+                for stat in ['example_count', 'avg_similarity', 'avg_execution_time', 
+                            'avg_entity_count', 'avg_relationship_count', 
+                            'avg_reachable_docs', 'avg_supporting_docs',
+                            'exact_match_count', 'exact_match_percentage',
+                            'partial_match_count', 'partial_match_percentage',
+                            'avg_f1_score', 'avg_precision', 'avg_recall']:
+                    expanded_stats[stat] = stats_df['statistics'].apply(
+                        lambda x: x.get(stat, 0) if isinstance(x, dict) else 0
+                    )
+                
+                # Display the expanded statistics
+                st.subheader("Experiment Statistics from CSV")
+                st.dataframe(expanded_stats)
+                
+                # Create visualizations for key metrics
+                st.subheader("Key Metrics by Experiment")
+                
+                # Create tabs for different metric categories
+                metric_tabs = st.tabs(["Answer Quality", "Document Retrieval", "Entity Statistics"])
+                
+                # Answer Quality tab
+                with metric_tabs[0]:
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        # Similarity score chart
+                        st.subheader("Average Similarity")
+                        fig = px.bar(
+                            expanded_stats, 
+                            x='experiment', 
+                            y='avg_similarity',
+                            title='Average Similarity by Experiment',
+                            labels={'avg_similarity': 'Similarity', 'experiment': 'Experiment'},
+                            text_auto='.2f'
+                        )
+                        fig.update_layout(yaxis_range=[0, 1])
+                        st.plotly_chart(fig, use_container_width=True)
+                    
+                    with col2:
+                        # Exact match percentage chart
+                        st.subheader("Exact Match Percentage")
+                        fig = px.bar(
+                            expanded_stats, 
+                            x='experiment', 
+                            y='exact_match_percentage',
+                            title='Exact Match Percentage by Experiment',
+                            labels={'exact_match_percentage': 'Exact Match %', 'experiment': 'Experiment'},
+                            text_auto='.1f'
+                        )
+                        fig.update_layout(yaxis_range=[0, 100])
+                        st.plotly_chart(fig, use_container_width=True)
+                
+                # Document Retrieval tab
+                with metric_tabs[1]:
+                    # Document retrieval metrics
+                    st.subheader("Document Retrieval")
+                    
+                    # Create a figure with two y-axes
+                    fig = make_subplots(specs=[[{"secondary_y": True}]])
+                    
+                    # Add bars for reachable docs
+                    fig.add_trace(
+                        go.Bar(
+                            x=expanded_stats['experiment'],
+                            y=expanded_stats['avg_reachable_docs'],
+                            name='Avg. Reachable Docs',
+                            marker_color='blue',
+                            text=expanded_stats['avg_reachable_docs'].round(1)
+                        ),
+                        secondary_y=False
+                    )
+                    
+                    # Add bars for supporting docs
+                    fig.add_trace(
+                        go.Bar(
+                            x=expanded_stats['experiment'],
+                            y=expanded_stats['avg_supporting_docs'],
+                            name='Avg. Supporting Docs',
+                            marker_color='green',
+                            text=expanded_stats['avg_supporting_docs'].round(1)
+                        ),
+                        secondary_y=False
+                    )
+                    
+                    # Update layout
+                    fig.update_layout(
+                        title='Document Retrieval by Experiment',
+                        barmode='group',
+                        legend=dict(
+                            orientation="h",
+                            yanchor="bottom",
+                            y=1.02,
+                            xanchor="right",
+                            x=1
+                        )
+                    )
+                    
+                    # Set y-axes titles
+                    fig.update_yaxes(title_text="Number of Documents", secondary_y=False)
+                    
+                    # Display the figure
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                # Entity Statistics tab
+                with metric_tabs[2]:
+                    # Entity and relationship counts
+                    st.subheader("Entity and Relationship Statistics")
+                    
+                    # Create a figure with two y-axes
+                    fig = make_subplots(specs=[[{"secondary_y": True}]])
+                    
+                    # Add bars for entity count
+                    fig.add_trace(
+                        go.Bar(
+                            x=expanded_stats['experiment'],
+                            y=expanded_stats['avg_entity_count'],
+                            name='Avg. Entity Count',
+                            marker_color='purple',
+                            text=expanded_stats['avg_entity_count'].round(1)
+                        ),
+                        secondary_y=False
+                    )
+                    
+                    # Add bars for relationship count
+                    fig.add_trace(
+                        go.Bar(
+                            x=expanded_stats['experiment'],
+                            y=expanded_stats['avg_relationship_count'],
+                            name='Avg. Relationship Count',
+                            marker_color='orange',
+                            text=expanded_stats['avg_relationship_count'].round(1)
+                        ),
+                        secondary_y=False
+                    )
+                    
+                    # Update layout
+                    fig.update_layout(
+                        title='Entity and Relationship Statistics by Experiment',
+                        barmode='group',
+                        legend=dict(
+                            orientation="h",
+                            yanchor="bottom",
+                            y=1.02,
+                            xanchor="right",
+                            x=1
+                        )
+                    )
+                    
+                    # Set y-axes titles
+                    fig.update_yaxes(title_text="Count", secondary_y=False)
+                    
+                    # Display the figure
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                # Execution time chart
+                st.subheader("Average Execution Time")
+                fig = px.bar(
+                    expanded_stats, 
+                    x='experiment', 
+                    y='avg_execution_time',
+                    title='Average Execution Time by Experiment',
+                    labels={'avg_execution_time': 'Time (s)', 'experiment': 'Experiment'},
+                    text_auto='.2f'
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Add a new row for F1, precision, and recall
+                st.subheader("Answer Evaluation Metrics")
+                fig = px.bar(
+                    expanded_stats, 
+                    x='experiment', 
+                    y=['avg_f1_score', 'avg_precision', 'avg_recall'],
+                    title='Answer Evaluation Metrics by Experiment',
+                    labels={
+                        'avg_f1_score': 'F1 Score', 
+                        'avg_precision': 'Precision', 
+                        'avg_recall': 'Recall', 
+                        'experiment': 'Experiment'
+                    },
+                    barmode='group'
+                )
+                fig.update_layout(yaxis_range=[0, 1])
+                st.plotly_chart(fig, use_container_width=True)
+            
+            except Exception as e:
+                st.error(f"Error parsing statistics: {e}")
+                st.dataframe(stats_df)
         else:
-            st.warning("Batch statistics not found.")
+            # Display the original statistics DataFrame
+            st.dataframe(stats_df)
+    elif not batch_results_available:
+        st.warning("No batch statistics found.")

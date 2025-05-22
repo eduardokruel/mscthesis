@@ -7,7 +7,7 @@ import time
 import cProfile
 import pstats
 import io
-from data_loader import load_musique_dataset, get_example_by_id
+from data_loader import load_musique_dataset, get_example_by_id, load_hotpotqa_dataset, load_dataset
 from deepseek_api import test_api, set_max_concurrent_requests
 from entity_extractor import EntityExtractor
 from graph_visualizer import visualize_entity_document_graph, visualize_entity_relationship_graph
@@ -21,6 +21,8 @@ import threading
 from rate_limiter import get_rate_limiter
 import networkx as nx
 import matplotlib.pyplot as plt
+from evaluation import AnswerEvaluator
+from stratified_sampler import stratified_sample, get_hop_distribution
 
 # Profiling decorator
 def profile_func(func):
@@ -46,7 +48,7 @@ def profile_func(func):
         return result
     return wrapper
 
-def process_single_question(example_id, df, args, output_dir):
+def process_single_question(example_id, df, args, output_dir, shared_extractor=None):
     """
     Process a single question and save results
     
@@ -55,6 +57,7 @@ def process_single_question(example_id, df, args, output_dir):
         df: DataFrame containing the dataset
         args: Command line arguments
         output_dir: Directory to save results
+        shared_extractor: Optional shared EntityExtractor instance
         
     Returns:
         Dictionary with experiment results
@@ -67,39 +70,88 @@ def process_single_question(example_id, df, args, output_dir):
         os.makedirs(example_dir, exist_ok=True)
         
         # Get the example
-        example = get_example_by_id(df, example_id)
+        example = df.iloc[int(example_id)]
         
-        # Save basic information
+        # Save question info
+        question_info = {
+            'question': example['question'],
+            'answer': example['answer'],
+            'dataset_type': args.dataset_type
+        }
+        
+        # Add dataset-specific fields
+        if args.dataset_type.lower() == 'hotpotqa':
+            question_info['type'] = example.get('type', '')
+            question_info['level'] = example.get('level', '')
+        
         with open(os.path.join(example_dir, "question_info.json"), "w") as f:
-            json.dump({
-                "id": example_id,
-                "question": example["question"],
-                "answer": example["answer"]
-            }, f, indent=2)
+            json.dump(question_info, f, indent=2)
         
         print(f"\nQuestion: {example['question']}")
         print(f"Answer: {example['answer']}")
         
         # Determine which experiments to run
-        experiments = ['standard', 'fuzzy_matching', 'llm_merging', 'sequential_context'] if args.experiment == 'all' else [args.experiment]
+        experiments = ['standard', 'fuzzy_matching', 'llm_merging', 'sequential_context', 'all_docs_baseline'] if args.experiment == 'all' else [args.experiment]
         
         # Store results for comparison
         experiment_results = []
         timing_data = {}
         
-        # Initialize the entity extractor once
-        extractor = EntityExtractor(
+        # Use the shared extractor if provided, otherwise create a new one
+        extractor = shared_extractor or EntityExtractor(
             verbose=args.verbose, 
             model_name=args.model,
-            use_cache=not args.disable_cache
+            use_cache=not args.disable_cache,
+            dataset_type=args.dataset_type  # Pass dataset type to EntityExtractor
         )
+        
+        # Check if we have cached data for this example
+        cached_data_available = extractor.check_example_cache(example_id, example)
+        if cached_data_available and not args.disable_cache:
+            print(f"Found cached data for example {example_id}")
         
         # Extract entities from question and paragraphs once for all experiments
         print("\nExtracting entities from question and paragraphs (shared across experiments)...")
         start_time = time.time()
         
-        # Extract question entities
-        question_entities = extractor.extract_entities_from_question(example['question'])
+        # Initialize a set to store all known entities across experiments
+        all_known_entities = set()
+
+        # For sequential_context experiment, we need to extract entities first
+        if 'sequential_context' in experiments:
+            print("Pre-extracting entities using sequential context approach...")
+            # Start with an empty set of known entities
+            known_entities = set()
+            
+            # Process paragraphs sequentially to build up entity knowledge
+            for i, paragraph in enumerate(tqdm(example['paragraphs'], desc="Building entity knowledge")):
+                # Create a document ID
+                doc_id = f"example_{example_id}_doc_{i}"
+                
+                # Extract entities with context
+                entities = extractor._extract_entities_with_context(
+                    paragraph['paragraph_text'], 
+                    list(known_entities),
+                    doc_id=doc_id
+                )
+                
+                # Update known entities
+                known_entities.update(entities)
+                
+                # Print entities found in this paragraph
+                if args.verbose:
+                    print(f"Paragraph {i} ({paragraph['title']}): {entities}")
+            
+            # Store all known entities for other experiments
+            all_known_entities = known_entities
+            print(f"Found {len(all_known_entities)} entities using sequential context")
+
+        # Extract question entities using known entities from sequential context if available
+        question_entities = extractor.extract_entities_from_question(
+            example['question'], 
+            list(all_known_entities) if all_known_entities else None,
+            question_id=example_id
+        )
         print(f"Entities in question: {question_entities}")
         
         # Pre-extract paragraph entities for all experiments
@@ -112,10 +164,14 @@ def process_single_question(example_id, df, args, output_dir):
                 
                 # Submit tasks for each paragraph
                 for i, paragraph in enumerate(example['paragraphs']):
+                    # Create a document ID
+                    doc_id = f"example_{example_id}_doc_{i}"
+                    
                     futures.append(
                         executor.submit(
                             extractor.extract_entities_from_paragraph,
-                            paragraph['paragraph_text']
+                            paragraph['paragraph_text'],
+                            doc_id=doc_id
                         )
                     )
                 
@@ -136,41 +192,49 @@ def process_single_question(example_id, df, args, output_dir):
         print(f"Entity extraction completed in {entity_extraction_time:.2f} seconds")
         
         # Run each experiment
-        for experiment_type in experiments:
-            print(f"\n{'='*50}")
-            print(f"RUNNING EXPERIMENT: {experiment_type}")
-            print(f"{'='*50}")
-            
-            # Create a directory for this experiment
-            exp_dir = os.path.join(example_dir, experiment_type)
+        for experiment in experiments:
+            print(f"\nRunning experiment: {experiment}")
+            exp_dir = os.path.join(example_dir, experiment)
             os.makedirs(exp_dir, exist_ok=True)
             
-            # Track timing for each major step
-            timing = {}
-            start_time = time.time()
-            
-            # Create bipartite graph based on experiment type
-            print("\nCreating bipartite graph...")
-            step_start = time.time()
-            
-            # Create a base graph with question entities
+            # Create a new graph for this experiment
             G = nx.Graph()
+            
+            # Add question entities to the graph
             for entity in question_entities:
                 G.add_node(entity, type='entity')
             
             # Apply the appropriate experiment
-            if experiment_type == 'standard':
-                G = extractor.apply_standard_experiment(G, example, question_entities, paragraph_entities)
-            elif experiment_type == 'fuzzy_matching':
-                G, mapped_question_entities = extractor.apply_fuzzy_matching_experiment(G, example, question_entities, paragraph_entities)
-                question_entities = mapped_question_entities  # Use the mapped entities
-            elif experiment_type == 'llm_merging':
-                G, mapped_question_entities = extractor.apply_llm_merging_experiment(G, example, question_entities, paragraph_entities)
-                question_entities = mapped_question_entities  # Use the mapped entities
-            elif experiment_type == 'sequential_context':
-                G, _ = extractor.apply_sequential_context_experiment(G, example, question_entities)
+            start_time = time.time()
             
-            timing['graph_creation'] = time.time() - step_start
+            if experiment == 'standard':
+                G, mapped_question_entities = extractor.apply_standard_experiment(G, example, question_entities)
+            elif experiment == 'fuzzy_matching':
+                G, mapped_question_entities = extractor.apply_fuzzy_matching_experiment(G, example, question_entities)
+            elif experiment == 'llm_merging':
+                G, mapped_question_entities = extractor.apply_llm_merging_experiment(G, example, question_entities)
+            elif experiment == 'sequential_context':
+                G, mapped_question_entities = extractor.apply_sequential_context_experiment(G, example, question_entities, example_id=example_id)
+            elif experiment == 'all_docs_baseline':
+                # For the baseline, we'll create a minimal graph structure just to maintain compatibility
+                # with the rest of the pipeline, but we won't do any entity extraction
+                for i, paragraph in enumerate(example['paragraphs']):
+                    doc_id = f"doc_{i}"
+                    G.add_node(doc_id, 
+                              type='document', 
+                              title=paragraph['title'], 
+                              text=paragraph['paragraph_text'],
+                              is_supporting=paragraph.get('is_supporting', False))
+                
+                # No entity extraction or relationship building
+                mapped_question_entities = question_entities
+            else:
+                print(f"Unknown experiment: {experiment}")
+                continue
+            
+            # Track timing for each major step
+            timing = {}
+            timing['graph_creation'] = time.time() - start_time
             print(f"Graph creation completed in {timing['graph_creation']:.2f} seconds")
             
             # After creating the bipartite graph and before finding reachable documents
@@ -212,7 +276,12 @@ def process_single_question(example_id, df, args, output_dir):
             # Find reachable documents
             print(f"\nFinding documents reachable within {args.max_hops} hops...")
             step_start = time.time()
-            reachable_docs = extractor.find_reachable_documents(G, question_entities, max_hops=args.max_hops)
+            if experiment == 'all_docs_baseline':
+                # For the baseline, all documents are "reachable"
+                reachable_docs = [n for n in G.nodes() if G.nodes[n].get('type') == 'document']
+                print(f"Using all {len(reachable_docs)} documents for baseline experiment")
+            else:
+                reachable_docs = find_reachable_documents(G, question_entities)
             timing['document_retrieval'] = time.time() - step_start
             print(f"Document retrieval completed in {timing['document_retrieval']:.2f} seconds")
             
@@ -231,7 +300,11 @@ def process_single_question(example_id, df, args, output_dir):
             # Create entity relationship graph based on reachable documents
             print("\nCreating entity relationship graph...")
             step_start = time.time()
-            entity_graph = extractor.create_entity_relationship_graph(G, reachable_docs)
+            if experiment == 'all_docs_baseline':
+                # For the baseline, we create an empty entity graph (no relationships)
+                entity_graph = nx.Graph()
+            else:
+                entity_graph = extractor.create_entity_relationship_graph(G, reachable_docs)
             timing['relationship_extraction'] = time.time() - step_start
             print(f"Relationship extraction completed in {timing['relationship_extraction']:.2f} seconds")
             
@@ -256,35 +329,51 @@ def process_single_question(example_id, df, args, output_dir):
             # Visualize the graphs and save them
             if not args.skip_visualization:
                 print("\nVisualizing entity-document graph...")
-                step_start = time.time()
-                fig = visualize_entity_document_graph(G, question_entities)
-                # Save with both naming conventions for compatibility
-                plt.savefig(os.path.join(exp_dir, "bipartite_graph.png"), dpi=300, bbox_inches='tight')
-                plt.savefig(os.path.join(exp_dir, "entity_document_graph.png"), dpi=300, bbox_inches='tight')
-                plt.close(fig)
-                timing['visualization_bipartite'] = time.time() - step_start
-                print(f"Bipartite graph visualization completed in {timing['visualization_bipartite']:.2f} seconds")
+                start_time = time.time()
+                
+                # Use non-GUI mode when running in parallel
+                visualize_entity_document_graph(
+                    G, 
+                    question_entities=question_entities, 
+                    reachable_docs=reachable_docs,
+                    save_path=os.path.join(exp_dir, "entity_document_graph.png"),
+                    non_interactive=shared_extractor is not None
+                )
+                
+                bipartite_viz_time = time.time() - start_time
+                print(f"Bipartite graph visualization completed in {bipartite_viz_time:.2f} seconds")
                 
                 print("\nVisualizing entity relationship graph...")
-                step_start = time.time()
-                fig = visualize_entity_relationship_graph(entity_graph)
-                # Save with both naming conventions for compatibility
-                plt.savefig(os.path.join(exp_dir, "relationship_graph.png"), dpi=300, bbox_inches='tight')
-                plt.savefig(os.path.join(exp_dir, "entity_relationship_graph.png"), dpi=300, bbox_inches='tight')
-                plt.close(fig)
-                timing['visualization_relationships'] = time.time() - step_start
-                print(f"Relationship graph visualization completed in {timing['visualization_relationships']:.2f} seconds")
+                start_time = time.time()
+                
+                visualize_entity_relationship_graph(
+                    entity_graph, 
+                    question_entities=question_entities,
+                    save_path=os.path.join(exp_dir, "entity_relationship_graph.png"),
+                    non_interactive=shared_extractor is not None
+                )
+                
+                relationship_viz_time = time.time() - start_time
+                print(f"Relationship graph visualization completed in {relationship_viz_time:.2f} seconds")
             
             # Generate answer based on entity relationships and documents
             print("\nGenerating answer based on entity relationships and documents...")
             step_start = time.time()
-            generated_answer = extractor.generate_answer(
-                example['question'], 
-                entity_graph, 
-                question_entities, 
-                reachable_docs,
-                G
-            )
+            if experiment == 'all_docs_baseline':
+                # For the baseline, generate answer using all documents directly
+                generated_answer = extractor.generate_answer_baseline(
+                    example['question'],
+                    reachable_docs,
+                    G
+                )
+            else:
+                generated_answer = extractor.generate_answer(
+                    example['question'], 
+                    entity_graph, 
+                    question_entities, 
+                    reachable_docs,
+                    G
+                )
             timing['answer_generation'] = time.time() - step_start
             print(f"Answer generation completed in {timing['answer_generation']:.2f} seconds")
             
@@ -300,30 +389,49 @@ def process_single_question(example_id, df, args, output_dir):
             timing['total'] = execution_time
             
             # Store timing data
-            timing_data[experiment_type] = timing
+            timing_data[experiment] = timing
+            
+            # Create an evaluator
+            evaluator = AnswerEvaluator()
+
+            # Evaluate the answer
+            evaluation_results = evaluator.evaluate(generated_answer, example["answer"])
+
+            # Add evaluation results to the experiment results
+            results = {
+                "generated_answer": generated_answer,
+                "reference_answer": example["answer"],
+                "similarity_score": sim_score,
+                "exact_match": evaluation_results["exact_match"],
+                "partial_match": evaluation_results.get("partial_match", False),
+                "f1_score": evaluation_results.get("f1_score", 0.0),
+                "precision": evaluation_results.get("precision", 0.0),
+                "recall": evaluation_results.get("recall", 0.0),
+                "extracted_answer": evaluation_results["extracted_prediction"],
+                "normalized_prediction": evaluation_results["normalized_prediction"],
+                "normalized_reference": evaluation_results["normalized_reference"],
+                "timing": timing_data,
+                "execution_time": execution_time
+            }
             
             # Save answer and metrics
             with open(os.path.join(exp_dir, "results.json"), "w") as f:
-                json.dump({
-                    "generated_answer": generated_answer,
-                    "expected_answer": example['answer'],
-                    "similarity_score": sim_score,
-                    "execution_time": execution_time,
-                    "entity_count": entity_graph.number_of_nodes(),
-                    "relationship_count": entity_graph.number_of_edges(),
-                    "reachable_docs_count": len(reachable_docs),
-                    "supporting_docs_count": len(supporting_docs)
-                }, f, indent=2)
+                json.dump(results, f, indent=2)
             
-            # Store results for comparison
+            # Update the experiment_results to include the new metrics
             experiment_results.append({
-                'experiment': experiment_type,
+                'experiment': experiment,
                 'reachable_docs': len(reachable_docs),
                 'supporting_docs': len(supporting_docs),
                 'entity_count': entity_graph.number_of_nodes(),
                 'relationship_count': entity_graph.number_of_edges(),
                 'answer': generated_answer,
                 'similarity': sim_score,
+                'exact_match': evaluation_results["exact_match"],
+                'partial_match': evaluation_results.get("partial_match", False),
+                'f1_score': evaluation_results.get("f1_score", 0.0),
+                'precision': evaluation_results.get("precision", 0.0),
+                'recall': evaluation_results.get("recall", 0.0),
                 'execution_time': execution_time
             })
             
@@ -346,6 +454,26 @@ def process_single_question(example_id, df, args, output_dir):
             # Save document classification results
             with open(os.path.join(exp_dir, "doc_classification.json"), "w") as f:
                 json.dump(doc_classification, f, indent=2)
+
+            # After creating the bipartite graph and before generating the answer
+            # Add this code to save the relationship graph:
+
+            # Create and save the entity relationship graph
+            entity_graph = nx.Graph()
+            for node in G.nodes():
+                if G.nodes[node].get('type') == 'entity':
+                    entity_graph.add_node(node, type='entity')
+
+            # Add edges between entities based on relationships
+            for u, v, data in G.edges(data=True):
+                if G.nodes[u].get('type') == 'entity' and G.nodes[v].get('type') == 'entity':
+                    entity_graph.add_edge(u, v, relation=data.get('relation', ''), source_doc=data.get('source_doc', ''))
+
+            # Save the relationship graph
+            relationship_graph_path = os.path.join(exp_dir, "relationship_graph.json")
+            nx.node_link_data(entity_graph)
+            with open(relationship_graph_path, 'w') as f:
+                json.dump(nx.node_link_data(entity_graph), f, indent=2)
         
         # If multiple experiments were run, save comparison
         if len(experiment_results) > 1:
@@ -370,6 +498,10 @@ def process_single_question(example_id, df, args, output_dir):
                         "supporting_docs": int(results_df.loc[results_df['supporting_docs'].idxmax()]['supporting_docs'])
                     }
                 }, f, indent=2)
+        
+        # Save entity caches to disk if we're not using a shared extractor
+        if not shared_extractor:
+            extractor.save_caches()
         
         return {
             "example_id": example_id,
@@ -420,7 +552,7 @@ def process_and_update_wrapper(args_tuple):
             "error": str(e)
         }
 
-def batch_process_questions(example_ids, df, args, max_parallel=3):
+def batch_process_questions(example_ids, df, args, max_parallel=4):
     """
     Process multiple questions in parallel
     
@@ -428,121 +560,128 @@ def batch_process_questions(example_ids, df, args, max_parallel=3):
         example_ids: List of example IDs to process
         df: DataFrame containing the dataset
         args: Command line arguments
-        max_parallel: Maximum number of questions to process in parallel
+        max_parallel: Maximum number of parallel processes
         
     Returns:
-        Tuple of (results, output_dir)
+        Tuple of (results, output_directory)
     """
     # Create output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = os.path.join("results", f"batch_{timestamp}")
     os.makedirs(output_dir, exist_ok=True)
     
-    # Save batch configuration
-    with open(os.path.join(output_dir, "batch_config.json"), "w") as f:
-        json.dump({
-            "timestamp": timestamp,
-            "example_ids": example_ids,
-            "max_parallel": max_parallel,
-            "experiment": args.experiment,
-            "max_hops": args.max_hops,
-            "max_workers": args.max_workers
-        }, f, indent=2)
+    # Create a shared extractor for all processes
+    shared_extractor = EntityExtractor(
+        verbose=args.verbose, 
+        model_name=args.model,
+        use_cache=not args.disable_cache,
+        dataset_type=args.dataset_type  # Pass dataset type to EntityExtractor
+    )
     
-    # Create a progress bar for overall batch progress
-    overall_progress = tqdm(total=len(example_ids), desc="Overall batch progress", position=0)
-    
-    # Process questions in parallel
+    # Process examples
     results = []
+    all_experiment_results = []
     
-    # Prepare arguments for each task
-    task_args = [(example_id, df, args, output_dir) for example_id in example_ids]
+    # Use tqdm for progress tracking
+    with tqdm(total=len(example_ids), desc="Overall batch progress") as pbar:
+        # Process in batches to limit parallelism
+        for i in range(0, len(example_ids), max_parallel):
+            batch = example_ids[i:i+max_parallel]
+            
+            # Process this batch in parallel
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel) as executor:
+                # Submit tasks
+                futures = {
+                    executor.submit(
+                        process_single_question, 
+                        example_id, 
+                        df, 
+                        args, 
+                        output_dir,
+                        shared_extractor  # Pass the shared extractor instance
+                    ): example_id for example_id in batch
+                }
+                
+                # Process results as they complete
+                for future in concurrent.futures.as_completed(futures):
+                    example_id = futures[future]
+                    try:
+                        result = future.result()
+                        results.append(result)
+                        
+                        # Extract experiment results for aggregation
+                        if 'results' in result and isinstance(result['results'], list):
+                            for exp_result in result['results']:
+                                if isinstance(exp_result, dict):
+                                    # Add example_id to each experiment result
+                                    exp_result['example_id'] = example_id
+                                    all_experiment_results.append(exp_result)
+                        
+                        print(f"Completed processing example {example_id}")
+                    except Exception as e:
+                        print(f"Error processing example {example_id}: {e}")
+                        traceback.print_exc()
+                    
+                    # Update progress bar
+                    pbar.update(1)
     
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_parallel) as executor:
-        # Submit all tasks
-        futures = [executor.submit(process_and_update_wrapper, arg) for arg in task_args]
-        
-        # Process results as they complete
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                result = future.result()
-                results.append(result)
-                overall_progress.update(1)
-                print(f"\nCompleted processing example {result['example_id']}")
-            except Exception as e:
-                print(f"Exception in future: {e}")
-                traceback.print_exc()
-    
-    # Close the progress bar
-    overall_progress.close()
-    
-    # Compile overall results
-    success_count = sum(1 for r in results if "error" not in r)
-    error_count = len(results) - success_count
-    
-    print(f"\n{'='*80}")
-    print(f"BATCH PROCESSING COMPLETE")
-    print(f"{'='*80}")
-    print(f"Total examples processed: {len(results)}")
-    print(f"Successful: {success_count}")
-    print(f"Failed: {error_count}")
-    
-    # Save overall results
+    # Save batch results
     with open(os.path.join(output_dir, "batch_results.json"), "w") as f:
         json.dump({
-            "total": len(results),
-            "successful": success_count,
-            "failed": error_count,
+            "timestamp": timestamp,
+            "num_examples": len(example_ids),
             "results": results
         }, f, indent=2)
     
-    # If we ran multiple experiments, create a comparison across all questions
-    if args.experiment == 'all':
-        # Collect all experiment results
-        all_experiment_results = []
-        
-        for result in results:
-            if "error" not in result and "results" in result:
-                for exp_result in result["results"]:
-                    # Create a copy of the experiment result to avoid modifying the original
-                    exp_copy = dict(exp_result) if isinstance(exp_result, dict) else {"result": exp_result}
-                    # Add the example_id to the copy
-                    exp_copy["example_id"] = result["example_id"]
-                    all_experiment_results.append(exp_copy)
-        
-        if all_experiment_results:
+    # Create a summary of experiment results
+    if all_experiment_results:
+        try:
             # Create a DataFrame
             all_results_df = pd.DataFrame(all_experiment_results)
             
             # Save to CSV
             all_results_df.to_csv(os.path.join(output_dir, "all_experiments.csv"), index=False)
             
-            # Calculate aggregate statistics by experiment type
-            try:
-                agg_stats = all_results_df.groupby('experiment').agg({
-                    'similarity': ['mean', 'std', 'min', 'max'],
-                    'supporting_docs': ['mean', 'sum'],
-                    'execution_time': ['mean', 'sum'],
-                    'example_id': 'count'
-                }).reset_index()
+            # Calculate statistics for each experiment
+            experiment_stats = {}
+            for experiment in all_results_df['experiment'].unique():
+                experiment_data = all_results_df[all_results_df['experiment'] == experiment]
                 
-                # Rename columns for clarity
-                agg_stats.columns = [
-                    'experiment', 
-                    'avg_similarity', 'std_similarity', 'min_similarity', 'max_similarity',
-                    'avg_supporting_docs', 'total_supporting_docs',
-                    'avg_execution_time', 'total_execution_time',
-                    'question_count'
-                ]
-                
-                # Save aggregate statistics
-                agg_stats.to_csv(os.path.join(output_dir, "experiment_statistics.csv"), index=False)
-                
-                print("\nExperiment Statistics:")
-                print(agg_stats.to_string(index=False))
-            except Exception as e:
-                print(f"Error generating statistics: {e}")
-                print("This may be due to unexpected result format.")
+                if not experiment_data.empty:
+                    # Calculate statistics
+                    stats = {
+                        'example_count': len(experiment_data),
+                        'avg_similarity': experiment_data['similarity'].mean(),
+                        'avg_execution_time': experiment_data['execution_time'].mean(),
+                        'avg_entity_count': experiment_data['entity_count'].mean(),
+                        'avg_relationship_count': experiment_data['relationship_count'].mean(),
+                        'avg_reachable_docs': experiment_data['reachable_docs'].mean(),
+                        'avg_supporting_docs': experiment_data['supporting_docs'].mean(),
+                        # Add exact match statistics
+                        'exact_match_count': sum(1 for _, row in experiment_data.iterrows() if row['exact_match']),
+                        'exact_match_percentage': (sum(1 for _, row in experiment_data.iterrows() if row['exact_match']) / len(experiment_data)) * 100,
+                        # Add partial match statistics
+                        'partial_match_count': sum(1 for _, row in experiment_data.iterrows() if row.get('partial_match', False)),
+                        'partial_match_percentage': (sum(1 for _, row in experiment_data.iterrows() if row.get('partial_match', False)) / len(experiment_data)) * 100,
+                        # Add F1, precision, and recall statistics
+                        'avg_f1_score': experiment_data.get('f1_score', pd.Series([0])).mean(),
+                        'avg_precision': experiment_data.get('precision', pd.Series([0])).mean(),
+                        'avg_recall': experiment_data.get('recall', pd.Series([0])).mean()
+                    }
+                    
+                    experiment_stats[experiment] = stats
+            
+            # Save experiment statistics to CSV
+            pd.DataFrame(list(experiment_stats.items()), columns=['experiment', 'statistics']).to_csv(os.path.join(output_dir, "experiment_statistics.csv"), index=False)
+            
+            print("\nExperiment Statistics:")
+            print(pd.DataFrame(experiment_stats).to_string(index=False))
+        except Exception as e:
+            print(f"Error generating statistics: {e}")
+            print("This may be due to unexpected result format.")
+    
+    # Save entity caches to disk after all processing
+    shared_extractor.save_caches()
     
     return results, output_dir
 
@@ -561,21 +700,81 @@ def show_api_usage():
         print(f"  Day: {usage['day']['count']}/{usage['day']['limit']} requests " +
               f"(resets in {usage['day']['reset_in']/3600:.1f}h)")
 
+def find_reachable_documents(G, question_entities):
+    """
+    Find documents that are reachable from question entities
+    
+    Args:
+        G: NetworkX graph
+        question_entities: List of entities from the question
+        
+    Returns:
+        List of document IDs that are reachable from question entities
+    """
+    # Get all document nodes
+    doc_nodes = [n for n in G.nodes() if G.nodes[n].get('type') == 'document']
+    
+    # Get all entity nodes
+    entity_nodes = [n for n in G.nodes() if G.nodes[n].get('type') == 'entity']
+    
+    # Create a subgraph with only entity-entity relationships
+    entity_graph = nx.Graph()
+    for entity in entity_nodes:
+        entity_graph.add_node(entity)
+    
+    for u, v, data in G.edges(data=True):
+        # Only include edges between entities
+        if u in entity_nodes and v in entity_nodes:
+            entity_graph.add_edge(u, v)
+    
+    # Find all entities reachable from question entities
+    reachable_entities = set()
+    for entity in question_entities:
+        if entity in entity_graph:
+            # Add the entity itself
+            reachable_entities.add(entity)
+            
+            # Add all entities reachable from this entity
+            for connected_entity in nx.node_connected_component(entity_graph, entity):
+                reachable_entities.add(connected_entity)
+    
+    # Find documents connected to reachable entities
+    reachable_docs = set()
+    for entity in reachable_entities:
+        for neighbor in G.neighbors(entity):
+            if G.nodes[neighbor].get('type') == 'document':
+                reachable_docs.add(neighbor)
+    
+    print(f"Found {len(reachable_docs)} documents reachable from {len(question_entities)} question entities")
+    print(f"Question entities: {question_entities}")
+    print(f"Reachable entities: {reachable_entities}")
+    
+    return list(reachable_docs)
+
 def main():
-    parser = argparse.ArgumentParser(description='Extract entities from MuSiQue dataset and visualize relationships')
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Process MuSiQue or HotpotQA dataset examples')
+    
+    # Add dataset type argument
+    parser.add_argument('--dataset-type', type=str, default="musique", choices=["musique", "hotpotqa"],
+                       help='Type of dataset to use (musique or hotpotqa)')
+    
+    # Add dataset path argument with appropriate default based on dataset type
+    parser.add_argument('--dataset-path', type=str, default=None,
+                       help='Path to the dataset file (defaults to standard path for selected dataset type)')
+    
     parser.add_argument('--test-api', action='store_true', help='Test the DeepSeek API connection')
     parser.add_argument('--example-id', type=str, help='ID of the example to process', default='6')
-    parser.add_argument('--dataset-path', type=str, help='Path to the MuSiQue dataset')
     parser.add_argument('--list-examples', action='store_true', help='List available example IDs')
     parser.add_argument('--max-hops', type=int, default=10, help='Maximum number of hops for document retrieval')
     parser.add_argument('--max-workers', type=int, default=1, help='Maximum number of parallel workers for API calls')
     parser.add_argument('--skip-bipartite', action='store_true', help='Skip bipartite graph visualization')
     parser.add_argument('--skip-visualization', action='store_true', help='Skip all visualizations')
-    parser.add_argument('--experiment', type=str, choices=['standard', 'fuzzy_matching', 'llm_merging', 'sequential_context', 'all'],
+    parser.add_argument('--experiment', type=str, choices=['standard', 'fuzzy_matching', 'llm_merging', 'sequential_context', 'all_docs_baseline', 'all'],
                        default='standard', help='Entity extraction experiment to run')
     parser.add_argument('--batch', action='store_true', help='Run batch processing on multiple examples')
     parser.add_argument('--batch-size', type=int, default=5, help='Number of examples to process in batch mode')
-    parser.add_argument('--max-parallel', type=int, default=1, help='Maximum number of examples to process in parallel')
+    parser.add_argument('--max-parallel', type=int, default=5, help='Maximum number of examples to process in parallel')
     parser.add_argument('--example-ids', type=str, help='Comma-separated list of example IDs to process in batch mode')
     parser.add_argument('--random-sample', action='store_true', help='Use random sampling for batch processing')
     parser.add_argument('--max-api-concurrency', type=int, default=1, 
@@ -583,17 +782,25 @@ def main():
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output with detailed timing information')
     parser.add_argument('--profile', action='store_true', help='Enable profiling for performance analysis')
     parser.add_argument('--model', type=str, default="deepseek-chat", 
-                       choices=["deepseek-chat", "gpt-4o-mini", "gpt-3.5-turbo", 
+                       choices=["deepseek-chat", "gpt-4o-mini", "gpt-3.5-turbo", "gpt-4.1-mini", 
                                "local:TheBloke/Llama-2-7B-Chat-GPTQ",
                                "local:TheBloke/Mistral-7B-Instruct-v0.2-GPTQ",
                                "local:TheBloke/Mixtral-8x7B-Instruct-v0.1-GPTQ",
                                "local:Qwen/Qwen2.5-0.5B",
-                               "local:Qwen/Qwen2.5-1.5B"],
+                               "local:Qwen/Qwen2.5-1.5B",
+                               "o4-mini"],
                        help='Model to use for API calls')
     parser.add_argument('--show-usage', action='store_true', help='Show current API usage statistics')
     parser.add_argument('--disable-cache', action='store_true', help='Disable caching of API responses')
     
     args = parser.parse_args()
+    
+    # Set default dataset path based on dataset type if not provided
+    if args.dataset_path is None:
+        if args.dataset_type.lower() == 'musique':
+            args.dataset_path = 'datasets/musique/musique_ans_v1.0_dev.jsonl'
+        else:  # hotpotqa
+            args.dataset_path = 'datasets/hotpotqa/hotpot_dev_distractor_v1.json'
     
     # Set the global API concurrency limit
     set_max_concurrent_requests(args.max_api_concurrency)
@@ -618,9 +825,9 @@ def main():
         return
     
     try:
-        # Load dataset
-        print("Loading dataset...")
-        df = load_musique_dataset(args.dataset_path)
+        # Load dataset using the new load_dataset function
+        print(f"Loading {args.dataset_type} dataset...")
+        df = load_dataset(args.dataset_type, args.dataset_path)
         
         # List examples if requested
         if args.list_examples:
@@ -639,8 +846,15 @@ def main():
                 # Random sample
                 example_ids = df.sample(min(args.batch_size, len(df))).index.tolist()
             else:
-                # Sequential batch from the beginning
-                example_ids = list(range(min(args.batch_size, len(df))))
+                # Use stratified sampling to ensure balanced hop distribution
+                print("Using stratified sampling based on hop counts...")
+                example_ids = stratified_sample(df, min(args.batch_size, len(df)))
+                
+                # Print the hop distribution in the sample
+                distribution = get_hop_distribution(df, example_ids)
+                print("Hop distribution in sample:")
+                for hop, percentage in sorted(distribution.items()):
+                    print(f"  {hop}-hop: {percentage:.2f}%")
             
             print(f"Batch processing {len(example_ids)} examples with max {args.max_parallel} in parallel")
             print(f"Example IDs: {example_ids}")
@@ -675,7 +889,10 @@ def main():
     except FileNotFoundError as e:
         print(f"Error: {e}")
         print("\nPlease specify the correct path to the dataset using --dataset-path")
-        print("Example: python main.py --dataset-path /path/to/musique_full_v1.0_dev.jsonl")
+        print("Examples:")
+        print("  python main.py --dataset-type musique --dataset-path /path/to/musique_full_v1.0_dev.jsonl")
+        print("  python main.py --dataset-type hotpotqa --dataset-path /path/to/hotpot_dev_distractor_v1.json")
+        print("  python main.py --dataset-type hotpotqa --dataset-path /path/to/hotpot_dev_fullwiki_v1.json")
         sys.exit(1)
     except Exception as e:
         print(f"Unexpected error: {e}")
