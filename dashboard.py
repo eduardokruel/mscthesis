@@ -11,6 +11,8 @@ import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 import nltk
+import re
+from collections import defaultdict
 
 # Set page configuration
 st.set_page_config(page_title="MuSiQue Experiment Dashboard", layout="wide")
@@ -23,6 +25,134 @@ try:
     nltk.data.find('corpora/wordnet')
 except LookupError:
     nltk.download('wordnet')
+
+def identify_hop_count(example_id):
+    """
+    Identify the hop count from an example ID.
+    
+    Args:
+        example_id: The ID of the example (e.g., "2hop__123456_789012")
+        
+    Returns:
+        int: The number of hops (2, 3, or 4) or None if not identifiable
+    """
+    if isinstance(example_id, str):
+        # Try to extract hop count from the ID format
+        match = re.match(r'(\d+)hop', example_id)
+        if match:
+            return int(match.group(1))
+    
+    return None
+
+def calculate_metrics_by_hop(all_experiment_results, batch_path=None):
+    """
+    Calculate F1, recall, and precision metrics grouped by hop count
+    
+    Args:
+        all_experiment_results: List of experiment result dictionaries
+        batch_path: Path to the batch directory to determine dataset type
+        
+    Returns:
+        Dictionary with metrics grouped by hop count and experiment
+    """
+    # Import here to avoid circular imports
+    import sys
+    import os
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from data_loader import load_dataset
+    
+    # Try to determine dataset type from the batch results
+    dataset_type = "musique"  # default
+    
+    if batch_path:
+        # Try to read dataset type from a question_info.json file in the batch
+        batch_dir = os.path.join("results", batch_path)
+        if os.path.exists(batch_dir):
+            # Look for any example directory to get dataset type
+            example_dirs = [d for d in os.listdir(batch_dir) if d.startswith("example_")]
+            if example_dirs:
+                question_info_path = os.path.join(batch_dir, example_dirs[0], "question_info.json")
+                if os.path.exists(question_info_path):
+                    try:
+                        with open(question_info_path, "r") as f:
+                            question_info = json.load(f)
+                            dataset_type = question_info.get("dataset_type", "musique")
+                    except Exception:
+                        pass  # Keep default
+    
+    # Try to load the dataset to get actual example IDs
+    try:
+        df = load_dataset(dataset_type)
+        print(f"Successfully loaded {dataset_type} dataset with {len(df)} examples")
+    except Exception as e:
+        print(f"Warning: Could not load dataset: {e}")
+        df = None
+    
+    # Group results by hop count and experiment
+    hop_groups = defaultdict(lambda: defaultdict(list))
+    
+    for result in all_experiment_results:
+        example_id = result.get('example_id')
+        experiment = result.get('experiment')
+        
+        # Get hop count from example ID
+        hop_count = None
+        
+        if df is not None and example_id is not None:
+            try:
+                # Convert example_id to int (it's the index) and get actual ID from dataset
+                idx = int(example_id)
+                if 0 <= idx < len(df):
+                    actual_example_id = df.iloc[idx].get('id', '')
+                    hop_count = identify_hop_count(str(actual_example_id))
+                    if hop_count:
+                        print(f"Example {idx}: {actual_example_id} -> {hop_count}-hop")
+            except (ValueError, IndexError) as e:
+                print(f"Error getting hop count for example {example_id}: {e}")
+        
+        if hop_count is None:
+            hop_count = 'unknown'
+        
+        hop_groups[hop_count][experiment].append(result)
+    
+    # Print summary of hop distribution
+    hop_counts = {}
+    for hop_count, experiments in hop_groups.items():
+        total_examples = sum(len(results) for results in experiments.values())
+        hop_counts[hop_count] = total_examples
+    
+    print(f"Hop distribution: {hop_counts}")
+    
+    # Calculate metrics for each hop count and experiment
+    metrics_by_hop = {}
+    
+    for hop_count, experiments in hop_groups.items():
+        metrics_by_hop[hop_count] = {}
+        
+        for experiment, results in experiments.items():
+            if not results:
+                continue
+                
+            # Extract metrics from results
+            f1_scores = [r.get('f1_score', 0) for r in results if 'f1_score' in r]
+            precision_scores = [r.get('precision', 0) for r in results if 'precision' in r]
+            recall_scores = [r.get('recall', 0) for r in results if 'recall' in r]
+            exact_matches = [r.get('exact_match', False) for r in results if 'exact_match' in r]
+            
+            # Calculate average metrics
+            metrics_by_hop[hop_count][experiment] = {
+                'example_count': len(results),
+                'avg_f1_score': np.mean(f1_scores) if f1_scores else 0,
+                'avg_precision': np.mean(precision_scores) if precision_scores else 0,
+                'avg_recall': np.mean(recall_scores) if recall_scores else 0,
+                'exact_match_count': sum(exact_matches) if exact_matches else 0,
+                'exact_match_percentage': (sum(exact_matches) / len(exact_matches) * 100) if exact_matches else 0,
+                'std_f1_score': np.std(f1_scores) if len(f1_scores) > 1 else 0,
+                'std_precision': np.std(precision_scores) if len(precision_scores) > 1 else 0,
+                'std_recall': np.std(recall_scores) if len(recall_scores) > 1 else 0
+            }
+    
+    return metrics_by_hop
 
 # Function to load results directory
 def load_results_directory():
@@ -641,12 +771,14 @@ if st.sidebar.checkbox("Show Batch Statistics", value=True):
                         # Calculate metrics
                         metrics = calculate_doc_metrics(reachable, true_supporting, all_docs)
                         
-                        # Add metrics to result
+                        # Add DOCUMENT RETRIEVAL metrics to result (with different names to avoid overriding answer metrics)
                         exp_result['supporting_and_reachable'] = len([doc for doc in reachable if doc in true_supporting])
-                        exp_result['precision'] = metrics["precision"]
-                        exp_result['recall'] = metrics["recall"]
-                        exp_result['f1'] = metrics["f1"]
-                        exp_result['accuracy'] = metrics["accuracy"]
+                        exp_result['doc_precision'] = metrics["precision"]  # Document retrieval precision
+                        exp_result['doc_recall'] = metrics["recall"]        # Document retrieval recall
+                        exp_result['doc_f1'] = metrics["f1"]                # Document retrieval F1
+                        exp_result['doc_accuracy'] = metrics["accuracy"]    # Document retrieval accuracy
+                        
+                        # Keep the original answer quality metrics (f1_score, precision, recall) as they were loaded from results.json
                     except Exception as e:
                         st.warning(f"Error calculating metrics for example {example_id}, experiment {exp_result['experiment']}: {e}")
                 
@@ -670,8 +802,13 @@ if st.sidebar.checkbox("Show Batch Statistics", value=True):
                     'example_id': ['count']
                 }
                 
+                # Add answer quality metrics if available
+                for metric in ['f1_score', 'precision', 'recall', 'exact_match', 'partial_match']:
+                    if metric in results_df.columns:
+                        metric_columns[metric] = ['mean', 'std', 'min', 'max']
+                
                 # Add document retrieval metrics if available
-                for metric in ['supporting_and_reachable', 'precision', 'recall', 'f1', 'accuracy']:
+                for metric in ['supporting_and_reachable', 'doc_precision', 'doc_recall', 'doc_f1', 'doc_accuracy']:
                     if metric in results_df.columns:
                         metric_columns[metric] = ['mean', 'std', 'min', 'max']
                 
@@ -701,10 +838,17 @@ if st.sidebar.checkbox("Show Batch Statistics", value=True):
                     'sum_supporting_and_reachable': 'total_supporting_and_reachable',
                     'mean_execution_time': 'avg_execution_time',
                     'sum_execution_time': 'total_execution_time',
-                    'mean_precision': 'avg_precision',
-                    'mean_recall': 'avg_recall',
-                    'mean_f1': 'avg_f1',
-                    'mean_accuracy': 'avg_accuracy'
+                    # Answer quality metrics
+                    'mean_f1_score': 'avg_answer_f1',
+                    'mean_precision': 'avg_answer_precision',
+                    'mean_recall': 'avg_answer_recall',
+                    'mean_exact_match': 'avg_exact_match',
+                    'mean_partial_match': 'avg_partial_match',
+                    # Document retrieval metrics  
+                    'mean_doc_precision': 'avg_doc_precision',
+                    'mean_doc_recall': 'avg_doc_recall',
+                    'mean_doc_f1': 'avg_doc_f1',
+                    'mean_doc_accuracy': 'avg_doc_accuracy'
                 }
                 
                 agg_stats = agg_stats.rename(columns={old: new for old, new in column_mapping.items() if old in agg_stats.columns})
@@ -728,19 +872,80 @@ if st.sidebar.checkbox("Show Batch Statistics", value=True):
                         chart_data = agg_stats[['experiment', 'avg_execution_time']]
                         st.bar_chart(chart_data.set_index('experiment'))
                 
+                # Answer quality metrics chart
+                if 'avg_answer_f1' in agg_stats.columns:
+                    st.subheader("Answer Quality Metrics")
+                    
+                    # Create a grouped bar chart for answer quality metrics
+                    available_cols = ['experiment']
+                    display_names = []
+                    actual_cols = []
+                    
+                    if 'avg_answer_f1' in agg_stats.columns:
+                        available_cols.append('avg_answer_f1')
+                        display_names.append('F1 Score')
+                        actual_cols.append('avg_answer_f1')
+                    if 'avg_answer_precision' in agg_stats.columns:
+                        available_cols.append('avg_answer_precision')
+                        display_names.append('Precision')
+                        actual_cols.append('avg_answer_precision')
+                    if 'avg_answer_recall' in agg_stats.columns:
+                        available_cols.append('avg_answer_recall')
+                        display_names.append('Recall')
+                        actual_cols.append('avg_answer_recall')
+                    if 'avg_exact_match' in agg_stats.columns:
+                        available_cols.append('avg_exact_match')
+                        display_names.append('Exact Match Rate')
+                        actual_cols.append('avg_exact_match')
+                    
+                    if len(actual_cols) > 0:
+                        answer_metrics_df = agg_stats[available_cols]
+                        
+                        # Create the figure
+                        fig = go.Figure()
+                        
+                        # Add bars for each metric
+                        for i, col in enumerate(actual_cols):
+                            fig.add_trace(go.Bar(
+                                x=answer_metrics_df['experiment'],
+                                y=answer_metrics_df[col],
+                                name=display_names[i],
+                                text=answer_metrics_df[col].round(3),
+                                textposition='auto'
+                            ))
+                        
+                        # Update layout
+                        fig.update_layout(
+                            title='Answer Quality Metrics by Experiment',
+                            xaxis_title='Experiment',
+                            yaxis_title='Score',
+                            barmode='group',
+                            yaxis=dict(range=[0, 1]),
+                            legend=dict(
+                                orientation="h",
+                                yanchor="bottom",
+                                y=1.02,
+                                xanchor="right",
+                                x=1
+                            )
+                        )
+                        
+                        # Display the figure
+                        st.plotly_chart(fig, use_container_width=True, key="answer_quality_metrics_chart")
+                
                 # Document retrieval metrics
-                if 'avg_precision' in agg_stats.columns:
+                if 'avg_doc_precision' in agg_stats.columns:
                     st.subheader("Document Retrieval Metrics")
                     
                     # Create a grouped bar chart using Plotly
-                    metrics_df = agg_stats[['experiment', 'avg_precision', 'avg_recall', 'avg_f1', 'avg_accuracy']]
+                    metrics_df = agg_stats[['experiment', 'avg_doc_precision', 'avg_doc_recall', 'avg_doc_f1', 'avg_doc_accuracy']]
                     
                     # Rename columns for display
                     metrics_df = metrics_df.rename(columns={
-                        'avg_precision': 'Precision',
-                        'avg_recall': 'Recall',
-                        'avg_f1': 'F1 Score',
-                        'avg_accuracy': 'Accuracy'
+                        'avg_doc_precision': 'Precision',
+                        'avg_doc_recall': 'Recall',
+                        'avg_doc_f1': 'F1 Score',
+                        'avg_doc_accuracy': 'Accuracy'
                     })
                     
                     # Create the figure
@@ -748,13 +953,14 @@ if st.sidebar.checkbox("Show Batch Statistics", value=True):
                     
                     # Add bars for each metric
                     for metric in ['Precision', 'Recall', 'F1 Score', 'Accuracy']:
-                        fig.add_trace(go.Bar(
-                            x=metrics_df['experiment'],
-                            y=metrics_df[metric],
-                            name=metric,
-                            text=metrics_df[metric].round(2),
-                            textposition='auto'
-                        ))
+                        if metric in metrics_df.columns:
+                            fig.add_trace(go.Bar(
+                                x=metrics_df['experiment'],
+                                y=metrics_df[metric],
+                                name=metric,
+                                text=metrics_df[metric].round(3),
+                                textposition='auto'
+                            ))
                     
                     # Update layout - explicitly set to GROUP mode
                     fig.update_layout(
@@ -774,6 +980,190 @@ if st.sidebar.checkbox("Show Batch Statistics", value=True):
                     
                     # Display the figure
                     st.plotly_chart(fig, use_container_width=True, key="retrieval_metrics_chart")
+            
+            # Add hop-based analysis if available
+            if all_experiment_results:
+                st.markdown("---")
+                st.subheader("Answer Quality Metrics by Question Type (Hop Count)")
+                
+                # Calculate metrics by hop
+                metrics_by_hop = calculate_metrics_by_hop(all_experiment_results, selected_batch)
+                
+                if metrics_by_hop:
+                    # Create a comprehensive DataFrame for all metrics
+                    hop_data = []
+                    for hop_count, experiments in metrics_by_hop.items():
+                        for experiment, metrics in experiments.items():
+                            hop_data.append({
+                                'hop_count': hop_count,
+                                'experiment': experiment,
+                                'example_count': metrics['example_count'],
+                                'avg_f1_score': metrics['avg_f1_score'],
+                                'avg_precision': metrics['avg_precision'],
+                                'avg_recall': metrics['avg_recall'],
+                                'exact_match_percentage': metrics['exact_match_percentage'],
+                                'std_f1_score': metrics['std_f1_score'],
+                                'std_precision': metrics['std_precision'],
+                                'std_recall': metrics['std_recall']
+                            })
+                    
+                    hop_df = pd.DataFrame(hop_data)
+                    
+                    if not hop_df.empty:
+                        # Display summary table
+                        st.subheader("Summary Table")
+                        # Format the DataFrame for better display
+                        display_df = hop_df.copy()
+                        display_df['avg_f1_score'] = display_df['avg_f1_score'].round(3)
+                        display_df['avg_precision'] = display_df['avg_precision'].round(3)
+                        display_df['avg_recall'] = display_df['avg_recall'].round(3)
+                        display_df['exact_match_percentage'] = display_df['exact_match_percentage'].round(1)
+                        
+                        # Rename columns for better display
+                        display_df = display_df.rename(columns={
+                            'hop_count': 'Hop Count',
+                            'experiment': 'Experiment',
+                            'example_count': 'Examples',
+                            'avg_f1_score': 'Avg F1',
+                            'avg_precision': 'Avg Precision',
+                            'avg_recall': 'Avg Recall',
+                            'exact_match_percentage': 'Exact Match %'
+                        })
+                        
+                        st.dataframe(display_df[['Hop Count', 'Experiment', 'Examples', 'Avg F1', 'Avg Precision', 'Avg Recall', 'Exact Match %']])
+                        
+                        # Create visualizations
+                        st.subheader("Answer Quality Metrics by Hop Count")
+                        
+                        # Create tabs for different visualizations
+                        viz_tabs = st.tabs(["F1 Score", "Precision & Recall", "Exact Match Rate", "All Metrics"])
+                        
+                        with viz_tabs[0]:
+                            # F1 Score by hop count and experiment
+                            fig = px.bar(
+                                hop_df, 
+                                x='hop_count', 
+                                y='avg_f1_score',
+                                color='experiment',
+                                title='Average F1 Score by Hop Count and Experiment',
+                                labels={'avg_f1_score': 'Average F1 Score', 'hop_count': 'Hop Count'},
+                                barmode='group',
+                                text='avg_f1_score'
+                            )
+                            fig.update_traces(texttemplate='%{text:.3f}', textposition='outside')
+                            fig.update_layout(yaxis_range=[0, 1])
+                            st.plotly_chart(fig, use_container_width=True)
+                        
+                        with viz_tabs[1]:
+                            # Precision and Recall side by side
+                            col1, col2 = st.columns(2)
+                            
+                            with col1:
+                                fig_precision = px.bar(
+                                    hop_df, 
+                                    x='hop_count', 
+                                    y='avg_precision',
+                                    color='experiment',
+                                    title='Average Precision by Hop Count',
+                                    labels={'avg_precision': 'Average Precision', 'hop_count': 'Hop Count'},
+                                    barmode='group',
+                                    text='avg_precision'
+                                )
+                                fig_precision.update_traces(texttemplate='%{text:.3f}', textposition='outside')
+                                fig_precision.update_layout(yaxis_range=[0, 1])
+                                st.plotly_chart(fig_precision, use_container_width=True)
+                            
+                            with col2:
+                                fig_recall = px.bar(
+                                    hop_df, 
+                                    x='hop_count', 
+                                    y='avg_recall',
+                                    color='experiment',
+                                    title='Average Recall by Hop Count',
+                                    labels={'avg_recall': 'Average Recall', 'hop_count': 'Hop Count'},
+                                    barmode='group',
+                                    text='avg_recall'
+                                )
+                                fig_recall.update_traces(texttemplate='%{text:.3f}', textposition='outside')
+                                fig_recall.update_layout(yaxis_range=[0, 1])
+                                st.plotly_chart(fig_recall, use_container_width=True)
+                        
+                        with viz_tabs[2]:
+                            # Exact Match Rate
+                            fig_exact = px.bar(
+                                hop_df, 
+                                x='hop_count', 
+                                y='exact_match_percentage',
+                                color='experiment',
+                                title='Exact Match Percentage by Hop Count',
+                                labels={'exact_match_percentage': 'Exact Match %', 'hop_count': 'Hop Count'},
+                                barmode='group',
+                                text='exact_match_percentage'
+                            )
+                            fig_exact.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
+                            fig_exact.update_layout(yaxis_range=[0, 100])
+                            st.plotly_chart(fig_exact, use_container_width=True)
+                        
+                        with viz_tabs[3]:
+                            # All metrics in one chart
+                            # Create a melted DataFrame for easier plotting
+                            metrics_melted = hop_df.melt(
+                                id_vars=['hop_count', 'experiment'],
+                                value_vars=['avg_f1_score', 'avg_precision', 'avg_recall'],
+                                var_name='metric',
+                                value_name='score'
+                            )
+                            
+                            # Rename metrics for better display
+                            metric_names = {
+                                'avg_f1_score': 'F1 Score',
+                                'avg_precision': 'Precision',
+                                'avg_recall': 'Recall'
+                            }
+                            metrics_melted['metric'] = metrics_melted['metric'].map(metric_names)
+                            
+                            fig_all = px.bar(
+                                metrics_melted,
+                                x='hop_count',
+                                y='score',
+                                color='experiment',
+                                facet_col='metric',
+                                title='All Answer Quality Metrics by Hop Count',
+                                labels={'score': 'Score', 'hop_count': 'Hop Count'},
+                                barmode='group'
+                            )
+                            fig_all.update_layout(yaxis_range=[0, 1])
+                            fig_all.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+                            st.plotly_chart(fig_all, use_container_width=True)
+                        
+                        # Statistical insights
+                        st.subheader("Statistical Insights")
+                        
+                        # Show how metrics change with hop count
+                        hop_summary = hop_df.groupby('hop_count').agg({
+                            'avg_f1_score': ['mean', 'std'],
+                            'avg_precision': ['mean', 'std'],
+                            'avg_recall': ['mean', 'std'],
+                            'exact_match_percentage': ['mean', 'std'],
+                            'example_count': 'sum'
+                        }).round(3)
+                        
+                        # Flatten column names
+                        hop_summary.columns = [f"{col[1]}_{col[0]}" if col[1] else col[0] for col in hop_summary.columns]
+                        hop_summary = hop_summary.reset_index()
+                        
+                        st.write("**Average metrics across all experiments by hop count:**")
+                        st.dataframe(hop_summary)
+                        
+                        # Best performing experiment by hop count
+                        st.write("**Best performing experiment by hop count (based on F1 score):**")
+                        best_by_hop = hop_df.loc[hop_df.groupby('hop_count')['avg_f1_score'].idxmax()]
+                        best_display = best_by_hop[['hop_count', 'experiment', 'avg_f1_score', 'avg_precision', 'avg_recall', 'exact_match_percentage']].round(3)
+                        st.dataframe(best_display)
+                    else:
+                        st.warning("No hop-based metrics data available.")
+                else:
+                    st.warning("No hop count information found in example IDs.")
             
             # Display timing data
             st.subheader("Timing Data by Experiment")

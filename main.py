@@ -91,7 +91,7 @@ def process_single_question(example_id, df, args, output_dir, shared_extractor=N
         print(f"Answer: {example['answer']}")
         
         # Determine which experiments to run
-        experiments = ['standard', 'fuzzy_matching', 'llm_merging', 'sequential_context', 'all_docs_baseline'] if args.experiment == 'all' else [args.experiment]
+        experiments = ['standard', 'fuzzy_matching', 'llm_merging', 'sequential_context', 'all_docs_baseline', 'supporting_docs_baseline'] if args.experiment == 'all' else [args.experiment]
         
         # Store results for comparison
         experiment_results = []
@@ -228,6 +228,19 @@ def process_single_question(example_id, df, args, output_dir, shared_extractor=N
                 
                 # No entity extraction or relationship building
                 mapped_question_entities = question_entities
+            elif experiment == 'supporting_docs_baseline':
+                # For the supporting_docs_baseline experiment, we'll create a minimal graph structure just to maintain compatibility
+                # with the rest of the pipeline, but we won't do any entity extraction
+                for i, paragraph in enumerate(example['paragraphs']):
+                    doc_id = f"doc_{i}"
+                    G.add_node(doc_id, 
+                              type='document', 
+                              title=paragraph['title'], 
+                              text=paragraph['paragraph_text'],
+                              is_supporting=paragraph.get('is_supporting', False))
+                
+                # No entity extraction or relationship building
+                mapped_question_entities = question_entities
             else:
                 print(f"Unknown experiment: {experiment}")
                 continue
@@ -280,8 +293,13 @@ def process_single_question(example_id, df, args, output_dir, shared_extractor=N
                 # For the baseline, all documents are "reachable"
                 reachable_docs = [n for n in G.nodes() if G.nodes[n].get('type') == 'document']
                 print(f"Using all {len(reachable_docs)} documents for baseline experiment")
+            elif experiment == 'supporting_docs_baseline':
+                # For the supporting_docs_baseline experiment, all documents are "reachable"
+                # For the supporting_docs_baseline experiment, only supporting documents are "reachable"
+                reachable_docs = [n for n in G.nodes() if G.nodes[n].get('type') == 'document' and G.nodes[n].get('is_supporting', False)]
+                print(f"Using {len(reachable_docs)} supporting documents for supporting_docs_baseline experiment")
             else:
-                reachable_docs = find_reachable_documents(G, question_entities)
+                reachable_docs = find_reachable_documents(G, question_entities, max_hops=args.max_hops)
             timing['document_retrieval'] = time.time() - step_start
             print(f"Document retrieval completed in {timing['document_retrieval']:.2f} seconds")
             
@@ -302,6 +320,9 @@ def process_single_question(example_id, df, args, output_dir, shared_extractor=N
             step_start = time.time()
             if experiment == 'all_docs_baseline':
                 # For the baseline, we create an empty entity graph (no relationships)
+                entity_graph = nx.Graph()
+            elif experiment == 'supporting_docs_baseline':
+                # For the supporting_docs_baseline experiment, we create an empty entity graph (no relationships)
                 entity_graph = nx.Graph()
             else:
                 entity_graph = extractor.create_entity_relationship_graph(G, reachable_docs)
@@ -361,6 +382,13 @@ def process_single_question(example_id, df, args, output_dir, shared_extractor=N
             step_start = time.time()
             if experiment == 'all_docs_baseline':
                 # For the baseline, generate answer using all documents directly
+                generated_answer = extractor.generate_answer_baseline(
+                    example['question'],
+                    reachable_docs,
+                    G
+                )
+            elif experiment == 'supporting_docs_baseline':
+                # For the supporting_docs_baseline experiment, generate answer using all documents directly
                 generated_answer = extractor.generate_answer_baseline(
                     example['question'],
                     reachable_docs,
@@ -700,54 +728,61 @@ def show_api_usage():
         print(f"  Day: {usage['day']['count']}/{usage['day']['limit']} requests " +
               f"(resets in {usage['day']['reset_in']/3600:.1f}h)")
 
-def find_reachable_documents(G, question_entities):
+def find_reachable_documents(G, question_entities, max_hops=2):
     """
-    Find documents that are reachable from question entities
+    Find documents that are reachable from question entities in a bipartite graph
     
     Args:
-        G: NetworkX graph
+        G: NetworkX bipartite graph (entities ↔ documents)
         question_entities: List of entities from the question
+        max_hops: Maximum number of hops to traverse
         
     Returns:
         List of document IDs that are reachable from question entities
     """
-    # Get all document nodes
-    doc_nodes = [n for n in G.nodes() if G.nodes[n].get('type') == 'document']
+    # Get all document and entity nodes
+    doc_nodes = set(n for n in G.nodes() if G.nodes[n].get('type') == 'document')
+    entity_nodes = set(n for n in G.nodes() if G.nodes[n].get('type') == 'entity')
     
-    # Get all entity nodes
-    entity_nodes = [n for n in G.nodes() if G.nodes[n].get('type') == 'entity']
-    
-    # Create a subgraph with only entity-entity relationships
-    entity_graph = nx.Graph()
-    for entity in entity_nodes:
-        entity_graph.add_node(entity)
-    
-    for u, v, data in G.edges(data=True):
-        # Only include edges between entities
-        if u in entity_nodes and v in entity_nodes:
-            entity_graph.add_edge(u, v)
-    
-    # Find all entities reachable from question entities
-    reachable_entities = set()
-    for entity in question_entities:
-        if entity in entity_graph:
-            # Add the entity itself
-            reachable_entities.add(entity)
-            
-            # Add all entities reachable from this entity
-            for connected_entity in nx.node_connected_component(entity_graph, entity):
-                reachable_entities.add(connected_entity)
-    
-    # Find documents connected to reachable entities
+    # Start with question entities that exist in the graph
+    current_entities = set(entity for entity in question_entities if entity in entity_nodes)
+    reachable_entities = set(current_entities)
     reachable_docs = set()
-    for entity in reachable_entities:
-        for neighbor in G.neighbors(entity):
-            if G.nodes[neighbor].get('type') == 'document':
-                reachable_docs.add(neighbor)
     
-    print(f"Found {len(reachable_docs)} documents reachable from {len(question_entities)} question entities")
+    if not current_entities:
+        print(f"Warning: None of the question entities {question_entities} found in graph")
+        return []
+    
+    # Perform breadth-first traversal for max_hops
+    for hop in range(max_hops):
+        # Find documents connected to current entities
+        new_docs = set()
+        for entity in current_entities:
+            for neighbor in G.neighbors(entity):
+                if neighbor in doc_nodes:
+                    new_docs.add(neighbor)
+        
+        # Add new documents to reachable set
+        reachable_docs.update(new_docs)
+        
+        # Find entities connected to the new documents
+        new_entities = set()
+        for doc in new_docs:
+            for neighbor in G.neighbors(doc):
+                if neighbor in entity_nodes and neighbor not in reachable_entities:
+                    new_entities.add(neighbor)
+        
+        # If no new entities found, we can stop early
+        if not new_entities:
+            break
+            
+        # Update reachable entities and prepare for next hop
+        reachable_entities.update(new_entities)
+        current_entities = new_entities
+    
+    print(f"Found {len(reachable_docs)} documents reachable from {len(question_entities)} question entities in {hop + 1} hops")
     print(f"Question entities: {question_entities}")
-    print(f"Reachable entities: {reachable_entities}")
+    print(f"Reachable entities: {sorted(list(reachable_entities))}")
     
     return list(reachable_docs)
 
@@ -766,11 +801,11 @@ def main():
     parser.add_argument('--test-api', action='store_true', help='Test the DeepSeek API connection')
     parser.add_argument('--example-id', type=str, help='ID of the example to process', default='6')
     parser.add_argument('--list-examples', action='store_true', help='List available example IDs')
-    parser.add_argument('--max-hops', type=int, default=10, help='Maximum number of hops for document retrieval')
+    parser.add_argument('--max-hops', type=int, default=5, help='Maximum number of hops for document retrieval')
     parser.add_argument('--max-workers', type=int, default=1, help='Maximum number of parallel workers for API calls')
     parser.add_argument('--skip-bipartite', action='store_true', help='Skip bipartite graph visualization')
     parser.add_argument('--skip-visualization', action='store_true', help='Skip all visualizations')
-    parser.add_argument('--experiment', type=str, choices=['standard', 'fuzzy_matching', 'llm_merging', 'sequential_context', 'all_docs_baseline', 'all'],
+    parser.add_argument('--experiment', type=str, choices=['standard', 'fuzzy_matching', 'llm_merging', 'sequential_context', 'all_docs_baseline', 'supporting_docs_baseline', 'all'],
                        default='standard', help='Entity extraction experiment to run')
     parser.add_argument('--batch', action='store_true', help='Run batch processing on multiple examples')
     parser.add_argument('--batch-size', type=int, default=5, help='Number of examples to process in batch mode')

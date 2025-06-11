@@ -387,7 +387,7 @@ class EntityExtractor:
     def create_entity_relationship_graph(self, G, reachable_docs):
         """
         Create a relationship graph between entities based on reachable documents.
-        Uses DeepSeek API to extract relationships between entities in parallel.
+        Uses caching to avoid redundant API calls.
         
         Args:
             G: The bipartite entity-document graph
@@ -406,51 +406,106 @@ class EntityExtractor:
         for entity in entities:
             entity_graph.add_node(entity)
         
-        # Process each reachable document
-        print(f"Extracting relationships from {len(reachable_docs)} documents in parallel...")
+        if self.verbose:
+            print(f"Initialized entity graph with {len(entities)} entities")
+            print(f"Sample entities: {entities[:10] if len(entities) > 10 else entities}")
         
-        # Prepare document data for parallel processing
-        doc_data = []
+        # Check which documents need relationship extraction
+        docs_needing_extraction = []
+        cached_relationships = []
+        
         for doc_id in reachable_docs:
             doc_text = G.nodes[doc_id]['text']
             doc_entities = [node for node in G.neighbors(doc_id) if G.nodes[node]['type'] == 'entity']
             
             # Only process documents with at least 2 entities
-            if len(doc_entities) >= 2:
-                doc_data.append({
-                    'doc_id': doc_id,
-                    'text': doc_text,
-                    'entities': doc_entities
-                })
-        
-        # Process documents in parallel
-        results = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            # Submit all document processing tasks
-            future_to_doc = {
-                executor.submit(self.process_document_relationships, doc): doc 
-                for doc in doc_data
-            }
+            if len(doc_entities) < 2:
+                continue
             
-            # Process results as they complete
-            for future in tqdm(concurrent.futures.as_completed(future_to_doc), 
-                              total=len(future_to_doc),
-                              desc="Extracting relationships"):
-                try:
-                    result = future.result()
-                    results.append(result)
-                except Exception as e:
-                    print(f"Error processing document: {e}")
+            # Check if relationships are already cached
+            # First check document-specific cache
+            doc_cache = self._load_document_cache(doc_id)
+            if "relationships" in doc_cache:
+                if self.verbose:
+                    print(f"Using document-specific cached relationships for {doc_id}")
+                cached_relationships.append({
+                    'doc_id': doc_id,
+                    'relationships': doc_cache["relationships"]
+                })
+                continue
+            
+            # Then check global cache using the same key format as extract_entity_relationships
+            cache_key = f"doc_relationships_{doc_id}"
+            if self.use_cache and cache_key in self.relationship_cache:
+                if self.verbose:
+                    print(f"Using cached relationships for document {doc_id} from global cache")
+                cached_relationships.append({
+                    'doc_id': doc_id,
+                    'relationships': self.relationship_cache[cache_key]
+                })
+                continue
+            
+            # Also check the old cache key format from extract_relationships_from_text
+            entities_str = ",".join(sorted(doc_entities))
+            old_cache_key = f"rel_{hash(doc_text)}_{hash(entities_str)}"
+            if self.use_cache and old_cache_key in self.relationship_cache:
+                if self.verbose:
+                    print(f"Using cached relationships (old format) for document {doc_id}")
+                # Convert old format to new format
+                old_relationships = self.relationship_cache[old_cache_key]
+                new_relationships = []
+                for rel in old_relationships:
+                    if isinstance(rel, tuple) and len(rel) == 3:
+                        new_relationships.append((rel[0], rel[1], rel[2]))
+                    
+                cached_relationships.append({
+                    'doc_id': doc_id,
+                    'relationships': new_relationships
+                })
+                continue
+            
+            # If not cached, add to extraction list
+            docs_needing_extraction.append({
+                'doc_id': doc_id,
+                'text': doc_text,
+                'entities': doc_entities,
+                'title': G.nodes[doc_id].get('title', '')
+            })
         
-        # Add all relationships to the graph
-        for result in results:
+        # Process cached relationships first
+        for result in cached_relationships:
             doc_id = result['doc_id']
             relationships = result['relationships']
             
+            if self.verbose:
+                print(f"Processing {len(relationships)} cached relationships for {doc_id}")
+            
             for rel in relationships:
-                source = rel['source']
-                target = rel['target']
-                relation = rel['relation']
+                if isinstance(rel, tuple) and len(rel) == 3:
+                    # New format: (entity1, entity2, relationship)
+                    source, target, relation = rel
+                elif isinstance(rel, list) and len(rel) == 3:
+                    # List format: [entity1, entity2, relationship]
+                    source, target, relation = rel
+                elif isinstance(rel, dict) and 'source' in rel and 'target' in rel and 'relation' in rel:
+                    # Old format: {"source": ..., "target": ..., "relation": ...}
+                    source = rel['source']
+                    target = rel['target']
+                    relation = rel['relation']
+                else:
+                    if self.verbose:
+                        print(f"Skipping invalid relationship format: {rel}")
+                    continue
+                
+                # Check if both entities exist in the entity graph, add them if missing
+                if source not in entity_graph.nodes():
+                    if self.verbose:
+                        print(f"Adding missing source entity '{source}' to entity graph")
+                    entity_graph.add_node(source)
+                if target not in entity_graph.nodes():
+                    if self.verbose:
+                        print(f"Adding missing target entity '{target}' to entity graph")
+                    entity_graph.add_node(target)
                 
                 # Add edge or update if it already exists
                 if entity_graph.has_edge(source, target):
@@ -466,12 +521,58 @@ class EntityExtractor:
                         documents={doc_id},
                         weight=1
                     )
+                    if self.verbose:
+                        print(f"Added relationship: {source} -> {target} ({relation})")
+        
+        # Process documents that need extraction
+        if docs_needing_extraction:
+            print(f"Extracting relationships from {len(docs_needing_extraction)} uncached documents...")
+            
+            # Use the more efficient extract_entity_relationships method
+            for doc_data in tqdm(docs_needing_extraction, desc="Extracting relationships"):
+                doc_id = doc_data['doc_id']
+                doc_text = doc_data['text']
+                doc_entities = doc_data['entities']
+                doc_title = doc_data['title']
+                
+                try:
+                    # Use extract_entity_relationships which has better caching
+                    relationships = self.extract_entity_relationships(
+                        doc_id, doc_text, doc_entities, doc_title
+                    )
+                    
+                    # Add relationships to the graph
+                    for entity1, entity2, relation in relationships:
+                        # Add edge or update if it already exists
+                        if entity_graph.has_edge(entity1, entity2):
+                            # If the edge exists, append the new relation to the list
+                            entity_graph[entity1][entity2]['relations'].append(relation)
+                            entity_graph[entity1][entity2]['documents'].add(doc_id)
+                            entity_graph[entity1][entity2]['weight'] += 1
+                        else:
+                            # Create a new edge with the relation
+                            entity_graph.add_edge(
+                                entity1, entity2, 
+                                relations=[relation], 
+                                documents={doc_id},
+                                weight=1
+                            )
+                            
+                except Exception as e:
+                    print(f"Error extracting relationships for document {doc_id}: {e}")
+        else:
+            print("All relationships found in cache - no API calls needed!")
+        
+        # Debug: Show graph state before removing isolated nodes
+        if self.verbose:
+            print(f"Entity graph before cleanup: {entity_graph.number_of_nodes()} nodes, {entity_graph.number_of_edges()} edges")
         
         # Remove isolated nodes (nodes with no edges)
         isolated_nodes = [node for node in entity_graph.nodes() if entity_graph.degree(node) == 0]
         entity_graph.remove_nodes_from(isolated_nodes)
         
-        print(f"Removed {len(isolated_nodes)} isolated nodes from the relationship graph")
+        if isolated_nodes:
+            print(f"Removed {len(isolated_nodes)} isolated nodes from the relationship graph")
         
         return entity_graph
 
@@ -576,6 +677,12 @@ class EntityExtractor:
             # Cache the result if caching is enabled
             if self.use_cache:
                 self.relationship_cache[cache_key] = valid_relationships
+                self.cache_modified = True
+                
+                # Save immediately to ensure it's persisted
+                self._save_cache(self.relationship_cache, "relationship_cache.json")
+                if self.verbose:
+                    print(f"Saved relationships to global cache with key {cache_key}")
             
             return valid_relationships
         except Exception as e:
@@ -843,11 +950,22 @@ class EntityExtractor:
         
         return G, mapped_question_entities
 
-    def _experiment_llm_merging(self, G, example, question_entities, paragraph_entities):
+    def _experiment_llm_merging(self, G, example, question_entities, paragraph_entities=None):
         """
         LLM merging approach: use pre-extracted entities and LLM to merge equivalent entities
         """
         print(f"Processing {len(example['paragraphs'])} paragraphs with LLM merging...")
+        
+        # Extract entities if not provided
+        if paragraph_entities is None:
+            paragraph_entities = {}
+            for i, paragraph in enumerate(tqdm(example['paragraphs'], desc="Extracting entities")):
+                doc_id = f"doc_{i}"
+                entities = self.extract_entities_from_paragraph(
+                    paragraph['paragraph_text'],
+                    doc_id=doc_id
+                )
+                paragraph_entities[i] = entities
         
         # Collect all entities for LLM merging
         all_entities = set(question_entities)
@@ -1026,7 +1144,7 @@ class EntityExtractor:
         
         return G, question_entities
 
-    def _extract_entities_with_context(self, paragraph_text, known_entities, doc_id=None):
+    def _extract_entities_with_context(self, paragraph_text, known_entities, doc_id=None, ner=True):
         """
         Extract entities from a paragraph with context from previously known entities
         
@@ -1065,25 +1183,45 @@ class EntityExtractor:
             print(f"Context includes {len(known_entities)} known entities")
         
         # Original implementation
-        prompt = f"""
-        Extract all important entities and concepts from the following paragraph, considering the list that have already been identified in related texts.
         
-        Paragraph: {paragraph_text}
-        
-        Previously identified entities and concepts:
-        {json.dumps(known_entities, indent=2)}
-        
-        INSTRUCTIONS:
-        1. Extract ALL types of entities and concepts that are important to understanding the paragraph.
-        2. Include both named entities (people, places, organizations, products) AND non-named entities (abstract concepts, events, ideas, etc.).
-        3. First identify any of the previously identified entities that appear in this paragraph.
-        4. Then identify new entities and concepts that haven't been identified yet.
-        5. Focus on entities that would be useful for answering questions about this paragraph.
-        6. Be comprehensive - don't miss important concepts even if they're not traditional named entities.
-        
-        Return only a JSON array of entity names, with no additional text.
-        Example: ["Entity1", "Entity2", "Entity3"]
-        """
+        if ner:
+            prompt = f"""
+            Extract all entities from the following paragraph:
+            
+            Paragraph: {paragraph_text}
+            
+            An entity is a real-world object such as a person, location, organization, product, etc.
+            
+            Here are some entities that have already been identified in related texts:
+            {json.dumps(known_entities, indent=2)}
+            
+            Please identify:
+            1. Any of the above entities that appear in this paragraph
+            2. New entities that haven't been identified yet
+            
+            Return only a JSON array of entity names, with no additional text.
+            Example: ["Entity1", "Entity2", "Entity3"]
+            """
+        else:
+            prompt = f"""
+            Extract all important entities and concepts from the following paragraph, considering the list that have already been identified in related texts.
+            
+            Paragraph: {paragraph_text}
+            
+            Previously identified entities and concepts:
+            {json.dumps(known_entities, indent=2)}
+            
+            INSTRUCTIONS:
+            1. Extract ALL types of entities and concepts that are important to understanding the paragraph.
+            2. Include both named entities (people, places, organizations, products) AND non-named entities (abstract concepts, events, ideas, etc.).
+            3. First identify any of the previously identified entities that appear in this paragraph.
+            4. Then identify new entities and concepts that haven't been identified yet.
+            5. Focus on entities that would be useful for answering questions about this paragraph.
+            6. Be comprehensive - don't miss important concepts even if they're not traditional named entities.
+            
+            Return only a JSON array of entity names, with no additional text.
+            Example: ["Entity1", "Entity2", "Entity3"]
+            """
         
         messages = [
             {"role": "system", "content": "You are a helpful assistant that extracts entities from text."},
@@ -1178,7 +1316,7 @@ class EntityExtractor:
         
         return entity_mapping
 
-    def apply_standard_experiment(self, G, example, question_entities, paragraph_entities):
+    def apply_standard_experiment(self, G, example, question_entities, paragraph_entities=None):
         """
         Apply the standard experiment to the graph using pre-extracted entities
         
@@ -1186,18 +1324,26 @@ class EntityExtractor:
             G: The initial graph with question entities
             example: The example data
             question_entities: Entities from the question
-            paragraph_entities: Pre-extracted entities from paragraphs
+            paragraph_entities: Pre-extracted entities from paragraphs (optional)
             
         Returns:
-            The updated graph
+            Tuple of (updated graph, mapped question entities)
         """
         print(f"Processing {len(example['paragraphs'])} paragraphs with standard approach...")
         
         # Process each paragraph with pre-extracted entities
         for i, paragraph in enumerate(tqdm(example['paragraphs'], desc="Processing paragraphs")):
             try:
-                # Get the pre-extracted entities
-                entities = paragraph_entities[i]
+                # Get the pre-extracted entities if provided, otherwise extract them
+                if paragraph_entities and i in paragraph_entities:
+                    entities = paragraph_entities[i]
+                else:
+                    # Create a document ID
+                    doc_id = f"doc_{i}"
+                    entities = self.extract_entities_from_paragraph(
+                        paragraph['paragraph_text'],
+                        doc_id=doc_id
+                    )
                 
                 # Create document node
                 doc_id = f"doc_{i}"
@@ -1215,9 +1361,9 @@ class EntityExtractor:
             except Exception as e:
                 print(f"Error processing paragraph {i}: {e}")
         
-        return G
+        return G, question_entities
 
-    def apply_fuzzy_matching_experiment(self, G, example, question_entities, paragraph_entities):
+    def apply_fuzzy_matching_experiment(self, G, example, question_entities, paragraph_entities=None):
         """
         Apply the fuzzy matching experiment to the graph using pre-extracted entities
         
@@ -1225,12 +1371,23 @@ class EntityExtractor:
             G: The initial graph with question entities
             example: The example data
             question_entities: Entities from the question
-            paragraph_entities: Pre-extracted entities from paragraphs
+            paragraph_entities: Pre-extracted entities from paragraphs (optional)
             
         Returns:
             Tuple of (updated graph, mapped question entities)
         """
         print(f"Processing {len(example['paragraphs'])} paragraphs with fuzzy matching...")
+        
+        # Extract entities if not provided
+        if paragraph_entities is None:
+            paragraph_entities = {}
+            for i, paragraph in enumerate(tqdm(example['paragraphs'], desc="Extracting entities")):
+                doc_id = f"doc_{i}"
+                entities = self.extract_entities_from_paragraph(
+                    paragraph['paragraph_text'],
+                    doc_id=doc_id
+                )
+                paragraph_entities[i] = entities
         
         # Collect all entities for fuzzy matching
         all_entities = set(question_entities)
@@ -1268,7 +1425,7 @@ class EntityExtractor:
         
         return G, mapped_question_entities
 
-    def apply_llm_merging_experiment(self, G, example, question_entities, paragraph_entities):
+    def apply_llm_merging_experiment(self, G, example, question_entities, paragraph_entities=None):
         """
         Apply the LLM merging experiment to the graph using pre-extracted entities
         
@@ -1276,12 +1433,23 @@ class EntityExtractor:
             G: The initial graph with question entities
             example: The example data
             question_entities: Entities from the question
-            paragraph_entities: Pre-extracted entities from paragraphs
+            paragraph_entities: Pre-extracted entities from paragraphs (optional)
             
         Returns:
             Tuple of (updated graph, mapped question entities)
         """
         print(f"Processing {len(example['paragraphs'])} paragraphs with LLM merging...")
+        
+        # Extract entities if not provided
+        if paragraph_entities is None:
+            paragraph_entities = {}
+            for i, paragraph in enumerate(tqdm(example['paragraphs'], desc="Extracting entities")):
+                doc_id = f"doc_{i}"
+                entities = self.extract_entities_from_paragraph(
+                    paragraph['paragraph_text'],
+                    doc_id=doc_id
+                )
+                paragraph_entities[i] = entities
         
         # Collect all entities for LLM merging
         all_entities = set(question_entities)
@@ -1367,23 +1535,9 @@ class EntityExtractor:
                 G.add_node(entity, type='entity')
                 G.add_edge(entity, doc_id)
             
-            # Extract relationships between entities in this document
-            if len(entities) >= 2:
-                relationships = self.extract_entity_relationships(
-                    doc_id,
-                    paragraph['paragraph_text'],
-                    entities,
-                    doc_title=paragraph['title']
-                )
-                
-                # Add relationships to the graph
-                for entity1, entity2, relation in relationships:
-                    # Make sure both entities exist in the graph
-                    if entity1 in G and entity2 in G:
-                        # Add relationship edge
-                        G.add_edge(entity1, entity2, relation=relation, source_doc=doc_id)
-                        if self.verbose:
-                            print(f"Added relationship: {entity1} -> {entity2} ({relation})")
+            # NOTE: We no longer extract relationships here during initial graph construction.
+            # Relationships will be extracted later only for reachable documents in 
+            # create_entity_relationship_graph method.
         
         return G, question_entities
 
@@ -1567,7 +1721,7 @@ class EntityExtractor:
                 self.relationship_cache[cache_key] = relationships
                 self.cache_modified = True
                 
-                # Also save immediately to ensure it's persisted
+                # Save immediately to ensure it's persisted
                 self._save_cache(self.relationship_cache, "relationship_cache.json")
                 if self.verbose:
                     print(f"Saved relationships to global cache with key {cache_key}")
