@@ -11,6 +11,7 @@ from data_loader import load_musique_dataset, get_example_by_id, load_hotpotqa_d
 from deepseek_api import test_api, set_max_concurrent_requests
 from entity_extractor import EntityExtractor
 from graph_visualizer import visualize_entity_document_graph, visualize_entity_relationship_graph
+from semantic_filter import SemanticDocumentFilter
 from difflib import SequenceMatcher
 import pandas as pd
 import concurrent.futures
@@ -103,6 +104,14 @@ def process_single_question(example_id, df, args, output_dir, shared_extractor=N
             model_name=args.model,
             use_cache=not args.disable_cache,
             dataset_type=args.dataset_type  # Pass dataset type to EntityExtractor
+        )
+        
+        # Create semantic filter instance
+        semantic_filter = SemanticDocumentFilter(
+            model_name=args.model,
+            use_cache=not args.disable_cache,
+            verbose=args.verbose,
+            embeddings_model=args.embeddings_model
         )
         
         # Check if we have cached data for this example
@@ -299,9 +308,59 @@ def process_single_question(example_id, df, args, output_dir, shared_extractor=N
                 reachable_docs = [n for n in G.nodes() if G.nodes[n].get('type') == 'document' and G.nodes[n].get('is_supporting', False)]
                 print(f"Using {len(reachable_docs)} supporting documents for supporting_docs_baseline experiment")
             else:
-                reachable_docs = find_reachable_documents(G, question_entities, max_hops=args.max_hops)
+                reachable_docs = find_reachable_documents(G, question_entities, args.max_hops)
             timing['document_retrieval'] = time.time() - step_start
             print(f"Document retrieval completed in {timing['document_retrieval']:.2f} seconds")
+            
+            # Apply semantic filtering if needed
+            print(f"\nChecking if semantic filtering is needed...")
+            step_start = time.time()
+            
+            # Check if semantic filtering is disabled
+            if args.disable_semantic_filtering:
+                print("Semantic filtering disabled by user")
+                filtering_info = {
+                    "original_count": len(reachable_docs),
+                    "threshold": args.semantic_threshold,
+                    "filtering_applied": False,
+                    "method_used": None,
+                    "final_count": len(reachable_docs),
+                    "filtering_time": 0.0,
+                    "removed_docs": [],
+                    "kept_docs": reachable_docs.copy(),
+                    "disabled": True
+                }
+                original_reachable_docs = reachable_docs.copy()
+                filtering_analysis = None
+            else:
+                # Apply semantic filtering with command line arguments
+                filtered_docs, filtering_info = semantic_filter.filter_documents_if_needed(
+                    question=example['question'],
+                    reachable_docs=reachable_docs,
+                    G=G,
+                    threshold=args.semantic_threshold,
+                    target_docs=args.semantic_target,
+                    method=args.semantic_method,
+                    use_dynamic_threshold=args.use_dynamic_threshold,
+                    hop_modifier=args.hop_modifier
+                )
+                
+                # Update reachable_docs with filtered results
+                original_reachable_docs = reachable_docs.copy()
+                reachable_docs = filtered_docs
+                
+                # Analyze filtering impact if filtering was applied
+                if filtering_info['filtering_applied']:
+                    filtering_analysis = semantic_filter.analyze_filtering_impact(
+                        original_reachable_docs, reachable_docs, G
+                    )
+                    print(f"Filtering impact: {filtering_analysis['original_precision']:.3f} → {filtering_analysis['precision_improvement']:.3f} precision")
+                    print(f"Supporting doc retention: {filtering_analysis['supporting_retention_rate']:.3f}")
+                else:
+                    filtering_analysis = None
+            
+            timing['semantic_filtering'] = time.time() - step_start
+            print(f"Semantic filtering completed in {timing['semantic_filtering']:.2f} seconds")
             
             # Count supporting documents
             supporting_docs = [doc_id for doc_id in reachable_docs if G.nodes[doc_id].get('is_supporting', False)]
@@ -312,7 +371,10 @@ def process_single_question(example_id, df, args, output_dir, shared_extractor=N
             with open(os.path.join(exp_dir, "reachable_docs.json"), "w") as f:
                 json.dump({
                     "reachable_docs": list(reachable_docs),
-                    "supporting_docs": supporting_docs
+                    "supporting_docs": supporting_docs,
+                    "original_reachable_docs": original_reachable_docs if filtering_info['filtering_applied'] else list(reachable_docs),
+                    "semantic_filtering": filtering_info,
+                    "filtering_analysis": filtering_analysis
                 }, f, indent=2)
             
             # Create entity relationship graph based on reachable documents
@@ -352,30 +414,38 @@ def process_single_question(example_id, df, args, output_dir, shared_extractor=N
                 print("\nVisualizing entity-document graph...")
                 start_time = time.time()
                 
-                # Use non-GUI mode when running in parallel
-                visualize_entity_document_graph(
-                    G, 
-                    question_entities=question_entities, 
-                    reachable_docs=reachable_docs,
-                    save_path=os.path.join(exp_dir, "entity_document_graph.png"),
-                    non_interactive=shared_extractor is not None
-                )
-                
-                bipartite_viz_time = time.time() - start_time
-                print(f"Bipartite graph visualization completed in {bipartite_viz_time:.2f} seconds")
+                try:
+                    # Use non-GUI mode when running in parallel
+                    visualize_entity_document_graph(
+                        G, 
+                        question_entities=question_entities, 
+                        reachable_docs=reachable_docs,
+                        save_path=os.path.join(exp_dir, "entity_document_graph.png"),
+                        non_interactive=shared_extractor is not None
+                    )
+                    
+                    bipartite_viz_time = time.time() - start_time
+                    print(f"Bipartite graph visualization completed in {bipartite_viz_time:.2f} seconds")
+                except Exception as e:
+                    print(f"Warning: Bipartite graph visualization failed: {e}")
+                    print("Continuing without bipartite visualization...")
                 
                 print("\nVisualizing entity relationship graph...")
                 start_time = time.time()
                 
-                visualize_entity_relationship_graph(
-                    entity_graph, 
-                    question_entities=question_entities,
-                    save_path=os.path.join(exp_dir, "entity_relationship_graph.png"),
-                    non_interactive=shared_extractor is not None
-                )
-                
-                relationship_viz_time = time.time() - start_time
-                print(f"Relationship graph visualization completed in {relationship_viz_time:.2f} seconds")
+                try:
+                    visualize_entity_relationship_graph(
+                        entity_graph, 
+                        question_entities=question_entities,
+                        save_path=os.path.join(exp_dir, "entity_relationship_graph.png"),
+                        non_interactive=shared_extractor is not None
+                    )
+                    
+                    relationship_viz_time = time.time() - start_time
+                    print(f"Relationship graph visualization completed in {relationship_viz_time:.2f} seconds")
+                except Exception as e:
+                    print(f"Warning: Relationship graph visualization failed: {e}")
+                    print("Continuing without relationship visualization...")
             
             # Generate answer based on entity relationships and documents
             print("\nGenerating answer based on entity relationships and documents...")
@@ -400,7 +470,8 @@ def process_single_question(example_id, df, args, output_dir, shared_extractor=N
                     entity_graph, 
                     question_entities, 
                     reachable_docs,
-                    G
+                    G,
+                    prompt_style=args.prompt_style
                 )
             timing['answer_generation'] = time.time() - step_start
             print(f"Answer generation completed in {timing['answer_generation']:.2f} seconds")
@@ -730,59 +801,61 @@ def show_api_usage():
 
 def find_reachable_documents(G, question_entities, max_hops=2):
     """
-    Find documents that are reachable from question entities in a bipartite graph
+    Find documents that are reachable from question entities within max_hops
     
     Args:
-        G: NetworkX bipartite graph (entities ↔ documents)
+        G: NetworkX graph
         question_entities: List of entities from the question
-        max_hops: Maximum number of hops to traverse
+        max_hops: Maximum number of hops to traverse (default: 2)
         
     Returns:
         List of document IDs that are reachable from question entities
     """
-    # Get all document and entity nodes
-    doc_nodes = set(n for n in G.nodes() if G.nodes[n].get('type') == 'document')
-    entity_nodes = set(n for n in G.nodes() if G.nodes[n].get('type') == 'entity')
+    # Get all document nodes
+    doc_nodes = [n for n in G.nodes() if G.nodes[n].get('type') == 'document']
     
-    # Start with question entities that exist in the graph
-    current_entities = set(entity for entity in question_entities if entity in entity_nodes)
-    reachable_entities = set(current_entities)
-    reachable_docs = set()
+    # Get all entity nodes
+    entity_nodes = [n for n in G.nodes() if G.nodes[n].get('type') == 'entity']
     
-    if not current_entities:
-        print(f"Warning: None of the question entities {question_entities} found in graph")
-        return []
+    # Create a subgraph with only entity-entity relationships
+    entity_graph = nx.Graph()
+    for entity in entity_nodes:
+        entity_graph.add_node(entity)
     
-    # Perform breadth-first traversal for max_hops
-    for hop in range(max_hops):
-        # Find documents connected to current entities
-        new_docs = set()
-        for entity in current_entities:
-            for neighbor in G.neighbors(entity):
-                if neighbor in doc_nodes:
-                    new_docs.add(neighbor)
-        
-        # Add new documents to reachable set
-        reachable_docs.update(new_docs)
-        
-        # Find entities connected to the new documents
-        new_entities = set()
-        for doc in new_docs:
-            for neighbor in G.neighbors(doc):
-                if neighbor in entity_nodes and neighbor not in reachable_entities:
-                    new_entities.add(neighbor)
-        
-        # If no new entities found, we can stop early
-        if not new_entities:
-            break
+    for u, v, data in G.edges(data=True):
+        # Only include edges between entities
+        if u in entity_nodes and v in entity_nodes:
+            entity_graph.add_edge(u, v)
+    
+    # Find all entities reachable from question entities within max_hops
+    reachable_entities = set()
+    for entity in question_entities:
+        if entity in entity_graph:
+            # Add the entity itself
+            reachable_entities.add(entity)
             
-        # Update reachable entities and prepare for next hop
-        reachable_entities.update(new_entities)
-        current_entities = new_entities
+            # Use single_source_shortest_path_length with cutoff to limit hops
+            try:
+                reachable_from_entity = nx.single_source_shortest_path_length(
+                    entity_graph, entity, cutoff=max_hops
+                )
+                # Add all entities within max_hops
+                for connected_entity in reachable_from_entity.keys():
+                    reachable_entities.add(connected_entity)
+            except nx.NetworkXError:
+                # If entity is isolated, just add itself
+                reachable_entities.add(entity)
     
-    print(f"Found {len(reachable_docs)} documents reachable from {len(question_entities)} question entities in {hop + 1} hops")
+    # Find documents connected to reachable entities
+    reachable_docs = set()
+    for entity in reachable_entities:
+        for neighbor in G.neighbors(entity):
+            if G.nodes[neighbor].get('type') == 'document':
+                reachable_docs.add(neighbor)
+    
+    print(f"Found {len(reachable_docs)} documents reachable from {len(question_entities)} question entities within {max_hops} hops")
     print(f"Question entities: {question_entities}")
-    print(f"Reachable entities: {sorted(list(reachable_entities))}")
+    print(f"Reachable entities ({len(reachable_entities)}): {list(reachable_entities)[:10]}{'...' if len(reachable_entities) > 10 else ''}")
     
     return list(reachable_docs)
 
@@ -801,7 +874,7 @@ def main():
     parser.add_argument('--test-api', action='store_true', help='Test the DeepSeek API connection')
     parser.add_argument('--example-id', type=str, help='ID of the example to process', default='6')
     parser.add_argument('--list-examples', action='store_true', help='List available example IDs')
-    parser.add_argument('--max-hops', type=int, default=5, help='Maximum number of hops for document retrieval')
+    parser.add_argument('--max-hops', type=int, default=10, help='Maximum number of hops for document retrieval')
     parser.add_argument('--max-workers', type=int, default=1, help='Maximum number of parallel workers for API calls')
     parser.add_argument('--skip-bipartite', action='store_true', help='Skip bipartite graph visualization')
     parser.add_argument('--skip-visualization', action='store_true', help='Skip all visualizations')
@@ -827,6 +900,25 @@ def main():
                        help='Model to use for API calls')
     parser.add_argument('--show-usage', action='store_true', help='Show current API usage statistics')
     parser.add_argument('--disable-cache', action='store_true', help='Disable caching of API responses')
+    parser.add_argument('--prompt-style', type=str, default="default", 
+                       choices=["default", "question_first", "documents_first", "chain_of_thought", 
+                               "step_by_step", "minimal", "detailed"],
+                       help='Prompt style for answer generation (default: default)')
+    parser.add_argument('--semantic-threshold', type=int, default=5,
+                       help='Minimum number of documents to trigger semantic filtering (default: 5)')
+    parser.add_argument('--semantic-target', type=int, default=None,
+                       help='Target number of documents after semantic filtering (default: same as threshold)')
+    parser.add_argument('--semantic-method', type=str, default="hybrid",
+                       choices=["tfidf", "llm", "embeddings", "hybrid"],
+                       help='Semantic filtering method (default: hybrid)')
+    parser.add_argument('--embeddings-model', type=str, default="all-MiniLM-L6-v2",
+                       help='Sentence transformer model to use for embeddings (default: all-MiniLM-L6-v2)')
+    parser.add_argument('--use-dynamic-threshold', action='store_true',
+                       help='Use dynamic threshold based on question complexity prediction')
+    parser.add_argument('--hop-modifier', type=int, default=0,
+                       help='Modifier to add/subtract from predicted hops for dynamic threshold (default: 0)')
+    parser.add_argument('--disable-semantic-filtering', action='store_true',
+                       help='Disable semantic filtering entirely')
     
     args = parser.parse_args()
     

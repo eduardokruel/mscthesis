@@ -61,7 +61,7 @@ class AnswerEvaluator:
         
         # Remove stop words and lemmatize
         try:
-            tokens = [self.lemmatizer.lemmatize(token) for token in tokens if token not in self.stop_words]
+        tokens = [self.lemmatizer.lemmatize(token) for token in tokens if token not in self.stop_words]
         except Exception as e:
             # Fallback if lemmatization fails
             print(f"Warning: Lemmatization failed: {e}")

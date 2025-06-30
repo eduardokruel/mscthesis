@@ -9,19 +9,23 @@ def visualize_entity_document_graph(G, question_entities=None, reachable_docs=No
     Create a visualization of the entity-document bipartite graph
     
     Args:
-        G: NetworkX graph
+        G: NetworkX bipartite graph
         question_entities: List of entities from the question to highlight
-        reachable_docs: List of document IDs that are reachable from question entities
+        reachable_docs: Set of document IDs that are reachable
         save_path: Path to save the visualization
         non_interactive: If True, use non-interactive backend (for parallel processing)
         
     Returns:
-        Matplotlib figure or None if non_interactive
+        Matplotlib figure or None if non_interactive or if error occurs
     """
+    try:
     # Use non-interactive backend if requested (for parallel processing)
     if non_interactive:
-        # Use a context manager to temporarily set the backend
-        with plt.rc_context({'backend': 'Agg'}):
+            matplotlib.use('Agg')  # Set backend before importing pyplot
+            
+        import matplotlib.pyplot as plt
+        
+        # Create figure
             fig = plt.figure(figsize=(12, 10))
             
             # Get entity and document nodes
@@ -29,36 +33,52 @@ def visualize_entity_document_graph(G, question_entities=None, reachable_docs=No
             doc_nodes = [n for n in G.nodes() if G.nodes[n].get('type') == 'document']
             
             # Create positions using spring layout
+        try:
             pos = nx.spring_layout(G, k=0.3, iterations=50, seed=42)
+        except Exception as e:
+            print(f"Warning: Spring layout failed, using random layout: {e}")
+            pos = nx.random_layout(G, seed=42)
             
             # Draw entity nodes
-            entity_colors = ['#ff9999' if n in question_entities else '#ff7f0e' for n in entity_nodes] if question_entities else ['#ff7f0e'] * len(entity_nodes)
+        if entity_nodes:
+            entity_colors = ['#ff9999' if n in (question_entities or []) else '#ff7f0e' for n in entity_nodes]
             nx.draw_networkx_nodes(G, pos, nodelist=entity_nodes, node_color=entity_colors, node_size=500, alpha=0.8)
             
             # Draw document nodes with different colors for supporting documents
+        if doc_nodes:
             supporting_docs = [n for n in doc_nodes if G.nodes[n].get('is_supporting', False)]
             non_supporting_docs = [n for n in doc_nodes if not G.nodes[n].get('is_supporting', False)]
             
+            if supporting_docs:
             nx.draw_networkx_nodes(G, pos, nodelist=supporting_docs, node_color='#2ca02c', node_size=700, alpha=0.8, node_shape='s')
+            if non_supporting_docs:
             nx.draw_networkx_nodes(G, pos, nodelist=non_supporting_docs, node_color='#1f77b4', node_size=700, alpha=0.8, node_shape='s')
             
             # Highlight reachable documents if provided
             if reachable_docs:
                 reachable_nodes = [n for n in doc_nodes if n in reachable_docs]
+                if reachable_nodes:
                 nx.draw_networkx_nodes(G, pos, nodelist=reachable_nodes, node_color='#1f77b4', 
                                       node_size=700, alpha=0.8, node_shape='s', linewidths=3, edgecolors='red')
             
             # Draw edges
+        if G.edges():
             nx.draw_networkx_edges(G, pos, width=1.0, alpha=0.5)
             
             # Draw labels with smaller font for better readability
-            entity_labels = {n: n for n in entity_nodes}
-            doc_labels = {n: n for n in doc_nodes}
-            
+        try:
+            if entity_nodes:
+                entity_labels = {n: str(n)[:20] + '...' if len(str(n)) > 20 else str(n) for n in entity_nodes}
             nx.draw_networkx_labels(G, pos, labels=entity_labels, font_size=8, font_weight='bold')
+            
+            if doc_nodes:
+                doc_labels = {n: str(n)[:15] + '...' if len(str(n)) > 15 else str(n) for n in doc_nodes}
             nx.draw_networkx_labels(G, pos, labels=doc_labels, font_size=8)
+        except Exception as e:
+            print(f"Warning: Could not draw labels: {e}")
             
             # Add legend
+        try:
             legend_elements = [
                 plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='#ff7f0e', markersize=10, label='Entity'),
                 plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='#1f77b4', markersize=10, label='Document'),
@@ -73,84 +93,39 @@ def visualize_entity_document_graph(G, question_entities=None, reachable_docs=No
                                                  label='Reachable Document', markeredgecolor='red', markeredgewidth=2))
             
             plt.legend(handles=legend_elements, loc='upper right')
+        except Exception as e:
+            print(f"Warning: Could not create legend: {e}")
             
             plt.axis('off')
             plt.tight_layout()
             
             # Save the figure
             if save_path:
-                plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            try:
+                plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
                 print(f"Saved bipartite graph visualization to {save_path}")
+            except Exception as e:
+                print(f"Warning: Could not save visualization to {save_path}: {e}")
+                # Try saving with simpler parameters
+                try:
+                    plt.savefig(save_path, dpi=150)
+                    print(f"Saved bipartite graph visualization to {save_path} (simplified)")
+                except Exception as e2:
+                    print(f"Error: Failed to save visualization: {e2}")
             
             # Close the figure to free memory
             plt.close(fig)
             
-            # Return None instead of a figure reference
+        # Return None for non-interactive mode
+        if non_interactive:
             return None
     else:
-        # Interactive mode - existing code
-        fig = plt.figure(figsize=(12, 10))
-        
-        # Get entity and document nodes
-        entity_nodes = [n for n in G.nodes() if G.nodes[n].get('type') == 'entity']
-        doc_nodes = [n for n in G.nodes() if G.nodes[n].get('type') == 'document']
-        
-        # Create positions using spring layout
-        pos = nx.spring_layout(G, k=0.3, iterations=50, seed=42)
-        
-        # Draw entity nodes
-        entity_colors = ['#ff9999' if n in question_entities else '#ff7f0e' for n in entity_nodes] if question_entities else ['#ff7f0e'] * len(entity_nodes)
-        nx.draw_networkx_nodes(G, pos, nodelist=entity_nodes, node_color=entity_colors, node_size=500, alpha=0.8)
-        
-        # Draw document nodes with different colors for supporting documents
-        supporting_docs = [n for n in doc_nodes if G.nodes[n].get('is_supporting', False)]
-        non_supporting_docs = [n for n in doc_nodes if not G.nodes[n].get('is_supporting', False)]
-        
-        nx.draw_networkx_nodes(G, pos, nodelist=supporting_docs, node_color='#2ca02c', node_size=700, alpha=0.8, node_shape='s')
-        nx.draw_networkx_nodes(G, pos, nodelist=non_supporting_docs, node_color='#1f77b4', node_size=700, alpha=0.8, node_shape='s')
-        
-        # Highlight reachable documents if provided
-        if reachable_docs:
-            reachable_nodes = [n for n in doc_nodes if n in reachable_docs]
-            nx.draw_networkx_nodes(G, pos, nodelist=reachable_nodes, node_color='#1f77b4', 
-                                  node_size=700, alpha=0.8, node_shape='s', linewidths=3, edgecolors='red')
-        
-        # Draw edges
-        nx.draw_networkx_edges(G, pos, width=1.0, alpha=0.5)
-        
-        # Draw labels with smaller font for better readability
-        entity_labels = {n: n for n in entity_nodes}
-        doc_labels = {n: n for n in doc_nodes}
-        
-        nx.draw_networkx_labels(G, pos, labels=entity_labels, font_size=8, font_weight='bold')
-        nx.draw_networkx_labels(G, pos, labels=doc_labels, font_size=8)
-        
-        # Add legend
-        legend_elements = [
-            plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='#ff7f0e', markersize=10, label='Entity'),
-            plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='#1f77b4', markersize=10, label='Document'),
-            plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='#2ca02c', markersize=10, label='Supporting Document')
-        ]
-        
-        if question_entities:
-            legend_elements.insert(0, plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='#ff9999', markersize=10, label='Question Entity'))
-        
-        if reachable_docs:
-            legend_elements.append(plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='#1f77b4', markersize=10, 
-                                             label='Reachable Document', markeredgecolor='red', markeredgewidth=2))
-        
-        plt.legend(handles=legend_elements, loc='upper right')
-        
-        plt.axis('off')
-        plt.tight_layout()
-        
-        # Save if needed
-        if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"Saved bipartite graph visualization to {save_path}")
-        
-        # Return the figure for interactive display
         return fig
+            
+    except Exception as e:
+        print(f"Error creating bipartite graph visualization: {e}")
+        print("Continuing without visualization...")
+        return None
 
 def create_entity_graph(entities_data):
     """Create a graph from entity data (original function kept for compatibility)"""
@@ -230,106 +205,132 @@ def visualize_entity_relationship_graph(G, question_entities=None, save_path=Non
         non_interactive: If True, use non-interactive backend (for parallel processing)
         
     Returns:
-        Matplotlib figure or None if non_interactive
+        Matplotlib figure or None if non_interactive or if error occurs
     """
+    try:
     # Use non-interactive backend if requested (for parallel processing)
     if non_interactive:
-        # Use a context manager to temporarily set the backend
-        with plt.rc_context({'backend': 'Agg'}):
+            import matplotlib
+            matplotlib.use('Agg')  # Set backend before importing pyplot
+            
+        import matplotlib.pyplot as plt
+        
+        # Create figure
             fig = plt.figure(figsize=(12, 10))
             
+        # Check if graph has nodes
+        if not G.nodes():
+            plt.text(0.5, 0.5, 'No entity relationships found', 
+                    horizontalalignment='center', verticalalignment='center', 
+                    transform=plt.gca().transAxes, fontsize=16)
+            plt.axis('off')
+            
+            if save_path:
+                try:
+                    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+                    print(f"Saved empty relationship graph to {save_path}")
+                except Exception as e:
+                    print(f"Warning: Could not save empty graph: {e}")
+            
+            plt.close(fig)
+            return None if non_interactive else fig
+        
             # Create positions using spring layout
+        try:
             pos = nx.spring_layout(G, k=0.3, iterations=50, seed=42)
+        except Exception as e:
+            print(f"Warning: Spring layout failed, using random layout: {e}")
+            try:
+                pos = nx.random_layout(G, seed=42)
+            except Exception as e2:
+                print(f"Error: Could not create layout: {e2}")
+                plt.close(fig)
+                return None
             
             # Draw nodes with different colors for question entities
+        try:
             if question_entities:
                 question_nodes = [n for n in G.nodes() if n in question_entities]
                 other_nodes = [n for n in G.nodes() if n not in question_entities]
                 
+                if question_nodes:
                 nx.draw_networkx_nodes(G, pos, nodelist=question_nodes, node_color='#ff9999', node_size=500, alpha=0.8)
+                if other_nodes:
                 nx.draw_networkx_nodes(G, pos, nodelist=other_nodes, node_color='#ff7f0e', node_size=500, alpha=0.8)
             else:
                 nx.draw_networkx_nodes(G, pos, node_color='#ff7f0e', node_size=500, alpha=0.8)
+        except Exception as e:
+            print(f"Warning: Could not draw nodes: {e}")
             
             # Draw edges with arrows
+        try:
+            if G.edges():
             nx.draw_networkx_edges(G, pos, width=1.0, alpha=0.5, arrows=True, arrowsize=15)
+        except Exception as e:
+            print(f"Warning: Could not draw edges: {e}")
             
             # Draw labels
-            nx.draw_networkx_labels(G, pos, font_size=8, font_weight='bold')
+        try:
+            node_labels = {n: str(n)[:15] + '...' if len(str(n)) > 15 else str(n) for n in G.nodes()}
+            nx.draw_networkx_labels(G, pos, labels=node_labels, font_size=8, font_weight='bold')
+        except Exception as e:
+            print(f"Warning: Could not draw node labels: {e}")
             
             # Draw edge labels (relationships)
-            edge_labels = {(u, v): d.get('relation', '') for u, v, d in G.edges(data=True)}
+        try:
+            edge_labels = {}
+            for u, v, d in G.edges(data=True):
+                if 'relations' in d and d['relations']:
+                    # Take the first relation if multiple exist
+                    relation = d['relations'][0] if isinstance(d['relations'], list) else d['relations']
+                    edge_labels[(u, v)] = str(relation)[:10] + '...' if len(str(relation)) > 10 else str(relation)
+                elif 'relation' in d:
+                    relation = str(d['relation'])
+                    edge_labels[(u, v)] = relation[:10] + '...' if len(relation) > 10 else relation
+            
+            if edge_labels:
             nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=6)
+        except Exception as e:
+            print(f"Warning: Could not draw edge labels: {e}")
             
             # Add legend if question entities are highlighted
+        try:
             if question_entities:
                 legend_elements = [
                     plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='#ff9999', markersize=10, label='Question Entity'),
                     plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='#ff7f0e', markersize=10, label='Other Entity')
                 ]
                 plt.legend(handles=legend_elements, loc='upper right')
+        except Exception as e:
+            print(f"Warning: Could not create legend: {e}")
             
             plt.axis('off')
             plt.tight_layout()
             
             # Save the figure
             if save_path:
-                plt.savefig(save_path, dpi=300, bbox_inches='tight')
-                print(f"Saved relationship graph visualization to {save_path}")
+            try:
+                plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+                print(f"Saved entity relationship graph to {save_path}")
+            except Exception as e:
+                print(f"Warning: Could not save visualization to {save_path}: {e}")
+                # Try saving with simpler parameters
+                try:
+                    plt.savefig(save_path, dpi=150)
+                    print(f"Saved entity relationship graph to {save_path} (simplified)")
+                except Exception as e2:
+                    print(f"Error: Failed to save visualization: {e2}")
             
             # Close the figure to free memory
             plt.close(fig)
             
-            # Return None in non-interactive mode
+        # Return None for non-interactive mode
+        if non_interactive:
             return None
     else:
-        # Create a new figure
-        fig = plt.figure(figsize=(12, 10))
-        
-        # Create positions using spring layout
-        pos = nx.spring_layout(G, k=0.3, iterations=50, seed=42)
-        
-        # Draw nodes with different colors for question entities
-        if question_entities:
-            question_nodes = [n for n in G.nodes() if n in question_entities]
-            other_nodes = [n for n in G.nodes() if n not in question_entities]
+            return fig
             
-            nx.draw_networkx_nodes(G, pos, nodelist=question_nodes, node_color='#ff9999', node_size=500, alpha=0.8)
-            nx.draw_networkx_nodes(G, pos, nodelist=other_nodes, node_color='#ff7f0e', node_size=500, alpha=0.8)
-        else:
-            nx.draw_networkx_nodes(G, pos, node_color='#ff7f0e', node_size=500, alpha=0.8)
-        
-        # Draw edges with arrows
-        nx.draw_networkx_edges(G, pos, width=1.0, alpha=0.5, arrows=True, arrowsize=15)
-        
-        # Draw labels
-        nx.draw_networkx_labels(G, pos, font_size=8, font_weight='bold')
-        
-        # Draw edge labels (relationships)
-        edge_labels = {(u, v): d.get('relation', '') for u, v, d in G.edges(data=True)}
-        nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=6)
-        
-        # Add legend if question entities are highlighted
-        if question_entities:
-            legend_elements = [
-                plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='#ff9999', markersize=10, label='Question Entity'),
-                plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='#ff7f0e', markersize=10, label='Other Entity')
-            ]
-            plt.legend(handles=legend_elements, loc='upper right')
-        
-        plt.axis('off')
-        plt.tight_layout()
-        
-        # Save the figure if a path is provided
-        if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"Saved relationship graph visualization to {save_path}")
-        
-        # Also save as entity_relationship_graph.png in the same directory
-        if save_path:
-            dir_path = os.path.dirname(save_path)
-            standard_path = os.path.join(dir_path, "entity_relationship_graph.png")
-            plt.savefig(standard_path, dpi=300, bbox_inches='tight')
-        
-        plt.show()
-        return fig
+    except Exception as e:
+        print(f"Error creating entity relationship graph visualization: {e}")
+        print("Continuing without visualization...")
+        return None

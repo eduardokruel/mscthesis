@@ -1,0 +1,32 @@
+# Core dependencies
+pandas>=1.5.0
+numpy>=1.21.0
+networkx>=2.8.0
+matplotlib>=3.5.0
+tqdm>=4.64.0
+
+# NLP and ML libraries
+nltk>=3.8.0
+sentence-transformers>=2.2.0
+scikit-learn>=1.1.0
+
+# API and LLM libraries
+langchain>=0.1.0
+langchain-openai>=0.0.5
+openai>=1.0.0
+transformers>=4.25.0
+torch>=1.13.0
+accelerate>=0.20.0
+
+# Web interface
+streamlit>=1.25.0
+plotly>=5.15.0
+
+# Utilities
+python-dotenv>=1.0.0
+requests>=2.28.0
+jsonlines>=3.1.0
+
+# Optional: For local model support
+# auto-gptq>=0.4.0  # Uncomment if using GPTQ models
+# bitsandbytes>=0.40.0  # Uncomment if using quantized models 

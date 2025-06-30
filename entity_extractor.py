@@ -406,10 +406,6 @@ class EntityExtractor:
         for entity in entities:
             entity_graph.add_node(entity)
         
-        if self.verbose:
-            print(f"Initialized entity graph with {len(entities)} entities")
-            print(f"Sample entities: {entities[:10] if len(entities) > 10 else entities}")
-        
         # Check which documents need relationship extraction
         docs_needing_extraction = []
         cached_relationships = []
@@ -455,8 +451,8 @@ class EntityExtractor:
                 old_relationships = self.relationship_cache[old_cache_key]
                 new_relationships = []
                 for rel in old_relationships:
-                    if isinstance(rel, tuple) and len(rel) == 3:
-                        new_relationships.append((rel[0], rel[1], rel[2]))
+                    if isinstance(rel, dict) and 'source' in rel and 'target' in rel and 'relation' in rel:
+                        new_relationships.append((rel['source'], rel['target'], rel['relation']))
                     
                 cached_relationships.append({
                     'doc_id': doc_id,
@@ -477,35 +473,34 @@ class EntityExtractor:
             doc_id = result['doc_id']
             relationships = result['relationships']
             
-            if self.verbose:
-                print(f"Processing {len(relationships)} cached relationships for {doc_id}")
-            
             for rel in relationships:
+                # Handle different relationship formats
                 if isinstance(rel, tuple) and len(rel) == 3:
                     # New format: (entity1, entity2, relationship)
-                    source, target, relation = rel
-                elif isinstance(rel, list) and len(rel) == 3:
-                    # List format: [entity1, entity2, relationship]
                     source, target, relation = rel
                 elif isinstance(rel, dict) and 'source' in rel and 'target' in rel and 'relation' in rel:
                     # Old format: {"source": ..., "target": ..., "relation": ...}
                     source = rel['source']
                     target = rel['target']
                     relation = rel['relation']
+                elif isinstance(rel, dict) and 'entity1' in rel and 'entity2' in rel and 'relationship' in rel:
+                    # Alternative old format: {"entity1": ..., "entity2": ..., "relationship": ...}
+                    source = rel['entity1']
+                    target = rel['entity2']
+                    relation = rel['relationship']
+                elif isinstance(rel, list) and len(rel) == 3:
+                    # List format: [entity1, entity2, relationship]
+                    source, target, relation = rel
                 else:
                     if self.verbose:
-                        print(f"Skipping invalid relationship format: {rel}")
+                        print(f"Skipping unrecognized relationship format: {rel}")
                     continue
                 
-                # Check if both entities exist in the entity graph, add them if missing
-                if source not in entity_graph.nodes():
+                # Validate that source and target are strings
+                if not isinstance(source, str) or not isinstance(target, str):
                     if self.verbose:
-                        print(f"Adding missing source entity '{source}' to entity graph")
-                    entity_graph.add_node(source)
-                if target not in entity_graph.nodes():
-                    if self.verbose:
-                        print(f"Adding missing target entity '{target}' to entity graph")
-                    entity_graph.add_node(target)
+                        print(f"Skipping relationship with non-string entities: {source} -> {target}")
+                    continue
                 
                 # Add edge or update if it already exists
                 if entity_graph.has_edge(source, target):
@@ -521,8 +516,6 @@ class EntityExtractor:
                         documents={doc_id},
                         weight=1
                     )
-                    if self.verbose:
-                        print(f"Added relationship: {source} -> {target} ({relation})")
         
         # Process documents that need extraction
         if docs_needing_extraction:
@@ -562,10 +555,6 @@ class EntityExtractor:
                     print(f"Error extracting relationships for document {doc_id}: {e}")
         else:
             print("All relationships found in cache - no API calls needed!")
-        
-        # Debug: Show graph state before removing isolated nodes
-        if self.verbose:
-            print(f"Entity graph before cleanup: {entity_graph.number_of_nodes()} nodes, {entity_graph.number_of_edges()} edges")
         
         # Remove isolated nodes (nodes with no edges)
         isolated_nodes = [node for node in entity_graph.nodes() if entity_graph.degree(node) == 0]
@@ -734,7 +723,7 @@ class EntityExtractor:
         
         return "\n".join(text_parts)
 
-    def generate_answer(self, question, entity_graph, question_entities, reachable_docs, G):
+    def generate_answer(self, question, entity_graph, question_entities, reachable_docs, G, prompt_style="default"):
         """
         Generate an answer to the question using the entity graph and reachable documents
         
@@ -744,6 +733,8 @@ class EntityExtractor:
             question_entities: List of entities from the question
             reachable_docs: Set of document IDs that are reachable
             G: The original bipartite entity-document graph
+            prompt_style: Style of prompt to use ("default", "question_first", "documents_first", 
+                         "chain_of_thought", "step_by_step", "minimal", "detailed")
             
         Returns:
             The generated answer
@@ -751,54 +742,227 @@ class EntityExtractor:
         # Generate text representation of the graph
         graph_text = self.generate_graph_text_representation(entity_graph, question_entities)
         
-        # Collect text from reachable documents
+        # Collect text from reachable documents (without revealing supporting status)
         doc_texts = []
+        
         for doc_id in reachable_docs:
             title = G.nodes[doc_id]['title']
             text = G.nodes[doc_id]['text']
-            is_supporting = G.nodes[doc_id].get('is_supporting', False)
             
-            # Mark supporting documents
-            support_marker = "[SUPPORTING]" if is_supporting else ""
-            doc_texts.append(f"DOCUMENT {doc_id} {support_marker}: {title}\n{text}")
+            # Don't reveal supporting status to the model
+            doc_texts.append(f"DOCUMENT {doc_id}: {title}\n{text}")
         
         # Combine all documents into a single context
         all_docs_text = "\n\n".join(doc_texts)
         
-        # Create the prompt for DeepSeek
-        prompt = f"""
-        I need to answer a question based on the following information:
+        # Create different prompt templates based on style
+        if prompt_style == "question_first":
+            prompt = f"""
+            QUESTION: {question}
+            
+            To answer this question, I have the following information:
+            
+            ENTITY RELATIONSHIPS:
+            {graph_text}
+            
+            RELEVANT DOCUMENTS:
+            {all_docs_text}
+            
+            Based on the above information, provide ONLY the exact answer to the question.
+            Answer should be concise - just a name, date, or short phrase.
+            """
+            
+        elif prompt_style == "documents_first":
+            prompt = f"""
+            Here are the relevant documents and entity relationships:
+            
+            RELEVANT DOCUMENTS:
+            {all_docs_text}
+            
+            ENTITY RELATIONSHIPS:
+            {graph_text}
+            
+            Now answer this question: {question}
+            
+            Provide ONLY the exact answer - no explanations or additional text.
+            """
+            
+        elif prompt_style == "chain_of_thought":
+            prompt = f"""
+            I need to answer this question: {question}
+            
+            Let me analyze the available information step by step:
+            
+            RELEVANT DOCUMENTS:
+            {all_docs_text}
+            
+            ENTITY RELATIONSHIPS:
+            {graph_text}
+            
+            Now I will think through this step by step and show my reasoning:
+            
+            REASONING:
+            Let me analyze what the question is asking for: [Think about the question type and what kind of answer is expected]
+            
+            Looking at the question entities: {', '.join(question_entities) if question_entities else 'None identified'}
+            [Explain how these entities relate to the question]
+            
+            Examining the documents for relevant information:
+            [Go through the documents and identify key facts that might help answer the question]
+            
+            Checking entity relationships:
+            [Explain how the entity relationships help connect information across documents]
+            
+            Connecting the information:
+            [Show how different pieces of information from different documents connect to form the answer]
+            
+            FINAL ANSWER: [Provide only the specific answer here - name, date, or short phrase]
+            """
+            
+        elif prompt_style == "step_by_step":
+            prompt = f"""
+            Question: {question}
+            
+            I will solve this step by step, showing my work:
+            
+            STEP 1 - ANALYZE THE QUESTION:
+            The question is asking for: [Identify what type of answer is needed]
+            Key entities in the question: {', '.join(question_entities) if question_entities else 'None identified'}
+            [Explain what these entities tell us about what we're looking for]
+            
+            STEP 2 - EXAMINE THE EVIDENCE:
+            {all_docs_text}
+            
+            From these documents, the key facts are:
+            [List the most important facts from each document that might help answer the question]
+            
+            STEP 3 - ANALYZE ENTITY RELATIONSHIPS:
+            {graph_text}
+            
+            The relationships show us:
+            [Explain how entities are connected and what this tells us]
+            
+            STEP 4 - CONNECT THE INFORMATION:
+            [Show how information from different documents connects through the entity relationships]
+            
+            STEP 5 - DETERMINE THE ANSWER:
+            Based on the evidence and connections above:
+            [Provide brief reasoning for why this is the answer]
+            
+            FINAL ANSWER: [Provide only the specific answer here - name, date, or short phrase]
+            """
+            
+        elif prompt_style == "minimal":
+            prompt = f"""
+            Q: {question}
+            
+            Context:
+            {all_docs_text}
+            
+            A:
+            """
+            
+        elif prompt_style == "detailed":
+            prompt = f"""
+            I am answering a multi-hop question that requires connecting information across multiple documents.
+            
+            QUESTION: {question}
+            
+            ANALYSIS OF QUESTION ENTITIES:
+            The question contains these key entities: {', '.join(question_entities) if question_entities else 'None identified'}
+            
+            RELEVANT DOCUMENTS:
+            {all_docs_text}
+            
+            ENTITY RELATIONSHIP GRAPH:
+            {graph_text}
+            
+            INSTRUCTIONS:
+            1. Analyze all the provided documents to find relevant information
+            2. Use the entity relationships to connect information across documents
+            3. The answer should be a specific, factual response (name, date, place, etc.)
+            4. Do not include explanations or reasoning in your response
+            5. If the answer is a person's name, provide the full name if available
+            
+            ANSWER:
+            """
+            
+        else:  # default style
+            prompt = f"""
+            I need to answer a question based on the following information:
+            
+            QUESTION: {question}
+            
+            {graph_text}
+            
+            RELEVANT DOCUMENTS:
+            {all_docs_text}
+            
+            Please provide ONLY the exact answer to the question - no explanations, no additional text.
+            For example, if the question asks "Who directed Titanic?" just answer "James Cameron".
+            Your answer should be as concise as possible, ideally just a name, date, or short phrase.
+            """
         
-        QUESTION: {question}
-        
-        {graph_text}
-        
-        RELEVANT DOCUMENTS:
-        {all_docs_text}
-        
-        Please provide ONLY the exact answer to the question - no explanations, no additional text.
-        For example, if the question asks "Who directed Titanic?" just answer "James Cameron".
-        Your answer should be as concise as possible, ideally just a name, date, or short phrase.
-        """
+        # Adjust system message based on prompt style
+        if prompt_style == "chain_of_thought":
+            system_message = "You are a helpful assistant that thinks step by step and provides detailed reasoning before giving a final answer. Always follow the exact format provided in the prompt, including the REASONING section and ending with 'FINAL ANSWER:' followed by only the specific answer."
+        elif prompt_style == "step_by_step":
+            system_message = "You are a helpful assistant that solves problems step by step, showing your work for each step. Always follow the exact format provided in the prompt, completing each step thoroughly and ending with 'FINAL ANSWER:' followed by only the specific answer."
+        elif prompt_style == "minimal":
+            system_message = "You are a helpful assistant that provides direct, concise answers."
+        else:
+            system_message = "You are a helpful assistant that provides concise, factual answers based on provided information."
         
         # Generate the answer using DeepSeek
         messages = [
-            {"role": "system", "content": "You are a helpful assistant that provides concise, factual answers based on provided information."},
+            {"role": "system", "content": system_message},
             {"role": "user", "content": prompt}
         ]
         
-        print("Generating answer using DeepSeek API...")
+        print(f"Generating answer using DeepSeek API with prompt style: {prompt_style}...")
         response = self.deepseek.generate_response(messages, temperature=0.1)
         
-        # Clean up the response to remove any explanatory text
-        # Look for patterns like "The answer is X" or "X is the answer"
+        # Clean up the response based on prompt style
         clean_response = response.strip()
         
-        # Remove common prefixes
+        if prompt_style in ["chain_of_thought", "step_by_step"]:
+            # For reasoning prompts, extract the final answer after "FINAL ANSWER:" or similar patterns
+            answer_patterns = [
+                r"FINAL ANSWER:\s*(.+?)(?:\n|$)",
+                r"final answer:\s*(.+?)(?:\n|$)",
+                r"ANSWER:\s*(.+?)(?:\n|$)",
+                r"answer:\s*(.+?)(?:\n|$)",
+                r"the answer is:?\s*(.+?)(?:\n|$)",
+                r"therefore,?\s*(.+?)(?:\n|$)",
+                r"so,?\s*(.+?)(?:\n|$)",
+                r"in conclusion,?\s*(.+?)(?:\n|$)"
+            ]
+            
+            for pattern in answer_patterns:
+                match = re.search(pattern, clean_response, re.IGNORECASE | re.DOTALL)
+                if match:
+                    extracted_answer = match.group(1).strip()
+                    # Remove any trailing punctuation or explanatory text
+                    extracted_answer = re.split(r'[.!?]', extracted_answer)[0].strip()
+                    clean_response = extracted_answer
+                    break
+            else:
+                # If no pattern matches, try to extract the last line as it might be the answer
+                lines = clean_response.split('\n')
+                if lines:
+                    # Look for the last non-empty line
+                    for line in reversed(lines):
+                        line = line.strip()
+                        if line and not line.startswith('[') and not line.endswith(']'):
+                            clean_response = line
+                            break
+        
+        # Remove common prefixes for all styles
         prefixes = [
             "The answer is ", "Answer: ", "The correct answer is ", 
             "Based on the information, ", "According to the documents, ",
-            "From the information provided, "
+            "From the information provided, ", "A: ", "Final answer: ",
+            "FINAL ANSWER: ", "final answer: "
         ]
         
         for prefix in prefixes:
@@ -813,6 +977,10 @@ class EntityExtractor:
         # Remove periods at the end
         if clean_response.endswith('.'):
             clean_response = clean_response[:-1]
+        
+        # Remove any remaining brackets or formatting artifacts
+        clean_response = re.sub(r'^\[.*?\]\s*', '', clean_response)
+        clean_response = re.sub(r'\s*\[.*?\]$', '', clean_response)
         
         return clean_response
 
@@ -927,8 +1095,7 @@ class EntityExtractor:
             try:
                 # Get the pre-extracted entities and map them
                 entities = paragraph_entities[i]
-                mapped_entities = [entity_mapping.get(entity, entity) for entity in entities]
-                
+                mapped_entities = [entity_mapping.get(entity, entity) for entity in entities]       
                 # Create document node
                 doc_id = f"doc_{i}"
                 G.add_node(doc_id, 
@@ -1535,9 +1702,23 @@ class EntityExtractor:
                 G.add_node(entity, type='entity')
                 G.add_edge(entity, doc_id)
             
-            # NOTE: We no longer extract relationships here during initial graph construction.
-            # Relationships will be extracted later only for reachable documents in 
-            # create_entity_relationship_graph method.
+            # Extract relationships between entities in this document
+            if len(entities) >= 2:
+                relationships = self.extract_entity_relationships(
+                    doc_id,
+                    paragraph['paragraph_text'],
+                    entities,
+                    doc_title=paragraph['title']
+                )
+                
+                # Add relationships to the graph
+                for entity1, entity2, relation in relationships:
+                    # Make sure both entities exist in the graph
+                    if entity1 in G and entity2 in G:
+                        # Add relationship edge
+                        G.add_edge(entity1, entity2, relation=relation, source_doc=doc_id)
+                        if self.verbose:
+                            print(f"Added relationship: {entity1} -> {entity2} ({relation})")
         
         return G, question_entities
 
